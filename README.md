@@ -16,6 +16,15 @@ Install a single skill:
 npx skills install greatgitsby/skills/example-skill
 ```
 
+### Claude Code
+
+This repo doubles as a Claude Code plugin marketplace. Add it and install:
+
+```
+/plugin marketplace add greatgitsby/skills
+/plugin install greatgitsby-skills@greatgitsby-skills
+```
+
 ## Layout
 
 This repo uses the flat layout. Each skill is a directory under `skills/` containing a `SKILL.md`:

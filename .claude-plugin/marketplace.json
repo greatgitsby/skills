@@ -1,0 +1,14 @@
+{
+  "name": "greatgitsby-skills",
+  "owner": {
+    "name": "greatgitsby"
+  },
+  "plugins": [
+    {
+      "name": "greatgitsby-skills",
+      "source": ".",
+      "description": "A collection of agent skills.",
+      "skills": "./skills"
+    }
+  ]
+}
