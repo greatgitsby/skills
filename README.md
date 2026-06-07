@@ -4,7 +4,7 @@ A collection of agent skills, installable with the [`skills`](https://github.com
 
 ## Install
 
-Use the [`skills`](https://github.com/vercel-labs/skills) CLI (the subcommand is `add`, not `install`):
+Use the [`skills`](https://github.com/vercel-labs/skills) CLI:
 
 ```bash
 npx skills add greatgitsby/skills                 # all skills in this repo
