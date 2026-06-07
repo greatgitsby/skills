@@ -1,21 +1,4 @@
----
-name: mdma
-description: >-
-  For comma.ai device development (comma four / mici, agnos-builder, openpilot),
-  operate the MDMA — the mici debug and monitoring adapter, a wired hardware debug
-  board — to do low-level things SSH and op.sh cannot. ONLY applies to a comma four
-  physically wired to an MDMA adapter; if there is no MDMA connected (the script
-  prints "MDMA not found."), this skill does not apply. Use whenever the user wants
-  to power the SOC on/off or cut/cycle VIN power, force or drop the device into QDL
-  mode (the un-brick path, e.g. "get it into QDL first" before flashing AGNOS or to
-  recover a bricked board), open the MSM UART / serial console, or reboot-and-profile
-  boot time — even if "MDMA" isn't named; the cue is physical power, QDL, serial, or
-  power-on boot timing on a comma four wired to an MDMA. Not for: software-only access
-  over SSH/op.sh, building AGNOS images, profiling openpilot/cereal inside a running
-  system, or power/serial on non-comma hardware or a comma four with no MDMA attached.
----
-
-# MDMA — mici debug and monitoring adapter
+# MDMA — mici debug and monitoring adapter (hardware debug board)
 
 The MDMA is a hardware debug adapter for low-level **comma four** (aka mici) development. It only works when a comma four is **physically wired to an MDMA adapter** — if no MDMA is connected, nothing here applies (the script prints `MDMA not found.`). It connects to the SOC over USB and a UART, and lets you:
 
@@ -44,7 +27,7 @@ If that path doesn't exist, the script prints `MDMA not found.` and exits (code 
 
 ## Commands
 
-Run from this skill's directory (or pass the full path to `scripts/mdma.py`):
+Run from the skill's directory (or pass the full path to `scripts/mdma.py`):
 
 | Command | What it does |
 | --- | --- |
@@ -126,8 +109,8 @@ QDL flashing is the un-brickable recovery/flash path. The general sequence (driv
 2. Run the QDL flasher (e.g. `qdl` / the agnos-builder flash script) to write images.
 3. `scripts/mdma.py reboot` — boot the freshly flashed system.
 
-## Maintaining this skill
+## Maintaining this reference
 
 `scripts/mdma.py` started as a **copy** of `agnos-builder/scripts/mdma.py`, but this copy has since diverged: the `bash` command (serial-console command execution with auto-login) is **skill-only** and does not exist upstream. When re-syncing after upstream changes, don't blindly overwrite — merge upstream changes in and keep the `bash` machinery: the `Mdma` methods `open_serial`, `_drain`, `_read_until`, `_ensure_login`, `exec`, `_extract`; the module-level `bash_script` arg resolver; the `zlib`/`base64` imports; and the `bash` subparser wiring.
 
-Then re-read this SKILL.md against the new command table / behavior and update as needed.
+Then re-read this reference against the new command table / behavior and update as needed.
