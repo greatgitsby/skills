@@ -13,7 +13,7 @@ npx skills install greatgitsby/skills
 Install a single skill:
 
 ```bash
-npx skills install greatgitsby/skills/example-skill
+npx skills install greatgitsby/skills/<skill-name>
 ```
 
 ### Claude Code
@@ -31,7 +31,7 @@ This repo uses the flat layout. Each skill is a directory under `skills/` contai
 
 ```
 skills/
-└── example-skill/
+└── <skill-name>/
     └── SKILL.md
 ```
 
