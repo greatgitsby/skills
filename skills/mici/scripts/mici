@@ -3,8 +3,12 @@
 
 The agent runs THIS on the host. It hides all device plumbing: it ensures the
 on-device driver is deployed (only re-pushes when its content changes), picks a
-transport (SSH if the mici is reachable, else the MDMA serial link), runs the driver
-under the device venv, and for `capture` pulls the PNG back to a local path.
+transport, runs the driver under the device venv, and for `capture` pulls the PNG
+back to a local path.
+
+Two first-class transports: SSH (needs a host) and the wired MDMA serial link
+(needs the adapter, no network). Choose with `--transport ssh|mdma|auto` (or the
+MICI_TRANSPORT env var); the default `auto` prefers the wired MDMA link, then SSH.
 
 Commands (coordinates are LANDSCAPE: lx 0..535, ly 0..239 — matching a screenshot):
   mici capture [OUT.png]                # default OUT: /tmp/mici.png ; prints the path
@@ -14,6 +18,10 @@ Commands (coordinates are LANDSCAPE: lx 0..535, ly 0..239 — matching a screens
   mici run 'STEP; STEP; ...' [--outdir DIR]   # chain steps in ONE device call
   mici run -                            # read chain script from stdin
   mici shell 'CMD'                      # run an arbitrary cmd on the device (escape hatch)
+
+Leading options (before the command): `--host USER@HOST` (or MICI_HOST env var) for
+SSH, and `--transport ssh|mdma|auto` (or MICI_TRANSPORT). e.g.
+`mici --host comma@192.168.1.5 capture` or `mici --transport mdma capture`.
 
 Chain steps (';' or newline separated, '#' comments): tap LX LY [HOLD],
 swipe LX1 LY1 LX2 LY2 [DUR], hold LX LY [DUR], wait S, capture [NAME].
@@ -28,7 +36,7 @@ import os
 import subprocess
 import sys
 
-HOST = "comma@10.0.0.22"
+HOST = os.environ.get("MICI_HOST")
 DEST = "/data/mici_ui.py"
 HASH_MARK = "/data/.mici_ui.sha"           # records the deployed driver's hash
 VENV_PY = "/usr/local/venv/bin/python"
@@ -107,17 +115,50 @@ def _shq(s):
 
 
 def main(argv):
+    global HOST
+
+    # Leading options (any order): --host USER@HOST, --transport ssh|mdma|auto.
+    want_transport = os.environ.get("MICI_TRANSPORT", "auto")
+    while argv:
+        if argv[0] in ("--host", "-H"):
+            if len(argv) < 2:
+                sys.exit("--host needs a value, e.g. --host comma@192.168.1.5")
+            HOST = argv[1]
+            argv = argv[2:]
+        elif argv[0] in ("--transport", "-t"):
+            if len(argv) < 2 or argv[1] not in ("ssh", "mdma", "auto"):
+                sys.exit("--transport needs one of: ssh, mdma, auto")
+            want_transport = argv[1]
+            argv = argv[2:]
+        else:
+            break
+
     if not argv:
         print(__doc__)
         return 2
     cmd = argv[0]
 
-    if _ssh_ok():
+    # Pick the transport. ssh and mdma are both first-class; auto prefers mdma, then ssh.
+    if want_transport == "ssh":
+        if not HOST:
+            sys.exit("ssh transport needs a host: pass --host USER@HOST or set MICI_HOST")
+        if not _ssh_ok():
+            sys.exit(f"mici unreachable: SSH to {HOST} failed")
         transport = "ssh"
-    elif _mdma_ok():
+    elif want_transport == "mdma":
+        if not _mdma_ok():
+            sys.exit("mici unreachable: no MDMA adapter found")
         transport = "mdma"
-    else:
-        sys.exit(f"mici unreachable: SSH to {HOST} failed and no MDMA adapter found")
+    else:  # auto — prefer the wired MDMA link, fall back to SSH
+        if _mdma_ok():
+            transport = "mdma"
+        elif HOST and _ssh_ok():
+            transport = "ssh"
+        elif HOST:
+            sys.exit(f"mici unreachable: no MDMA adapter found and SSH to {HOST} failed")
+        else:
+            sys.exit("no device: wire an MDMA adapter, or pass --host USER@HOST "
+                     "(or set MICI_HOST) for SSH")
 
     if cmd == "shell":
         run = _run_ssh if transport == "ssh" else _run_mdma
