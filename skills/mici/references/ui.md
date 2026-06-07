@@ -102,12 +102,15 @@ Verified behavior on the mici offroad UI (openpilot 0.11.x, `MiciMainLayout`):
   items. If a swipe seems to "escape" to the wrong screen, it bubbled to the main
   scroller — re-capture and reorient rather than assuming the tap failed.
 
-## When it can't reach the device
+## Transports
 
-The CLI errors if neither transport is available:
-- **SSH** to `comma@10.0.0.22` is preferred (faster). Needs your key on the device.
-- **MDMA serial** is the fallback and needs the MDMA adapter wired (see `references/mdma.md`).
-  Works with no network.
+Two first-class transports, selected with `--transport ssh|mdma|auto` (or the
+`MICI_TRANSPORT` env var). The CLI errors if the chosen transport isn't available.
+- **MDMA serial** — needs the MDMA adapter wired (see `references/mdma.md`). Works
+  with no network and needs no host.
+- **SSH** — needs your key on the device; give the host with `--host USER@HOST`
+  (e.g. `--host comma@192.168.1.5`) or the `MICI_HOST` env var.
+- **auto** (default) — prefers MDMA when the adapter is wired, else falls back to SSH.
 
 If capture errors with "magic broker did not pass a DRM fd", the display service is
 down — check `mici shell 'systemctl status magic.service'`.

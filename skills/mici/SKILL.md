@@ -28,19 +28,24 @@ See and drive the touchscreen for testing UI changes. One host CLI,
 screenshots back):
 
 ```bash
-$SKILL_DIR/scripts/mici capture [OUT.png]              # screenshot -> Read the printed path
-$SKILL_DIR/scripts/mici tap LX LY                      # landscape coords (536x240)
-$SKILL_DIR/scripts/mici swipe LX1 LY1 LX2 LY2
-$SKILL_DIR/scripts/mici hold LX LY
-$SKILL_DIR/scripts/mici run 'tap 268 120; wait .6; capture'   # chain steps in one call
+$SKILL_DIR/scripts/mici --transport mdma capture [OUT.png]    # wired adapter, no network
+$SKILL_DIR/scripts/mici --host comma@HOST capture [OUT.png]   # over SSH; prints PNG path
+$SKILL_DIR/scripts/mici --host comma@HOST tap LX LY           # landscape coords (536x240)
+$SKILL_DIR/scripts/mici --host comma@HOST swipe LX1 LY1 LX2 LY2
+$SKILL_DIR/scripts/mici --host comma@HOST hold LX LY
+$SKILL_DIR/scripts/mici --host comma@HOST run 'tap 268 120; wait .6; capture'   # chain in one call
 ```
 
-Coordinates are upright-landscape (the frame you see in a capture). Prefer
-`mici run` for multi-step flows — it runs the whole chain in one device invocation.
-Works over SSH (`comma@10.0.0.22`) or, with no network, over the wired MDMA serial
-link. **See `references/ui.md`** for coordinates, the chain step language, openpilot
-UI navigation behavior (home-is-one-big-button, the ~30 s interactive timeout,
-swipe scroller routing), and internals.
+Two first-class transports, chosen with `--transport ssh|mdma|auto` (or `MICI_TRANSPORT`):
+- **mdma** — the wired adapter, no network. Needs no host.
+- **ssh** — pass `--host USER@HOST` (or set `MICI_HOST`); ask the user for it if unknown.
+- **auto** (default) — prefers MDMA if the adapter is wired, else SSH.
+
+Coordinates are upright-landscape (the frame you see in a capture). Prefer `mici run`
+for multi-step flows — it runs the whole chain in one device invocation. **See
+`references/ui.md`** for coordinates, the chain step language, openpilot UI navigation
+behavior (home-is-one-big-button, the ~30 s interactive timeout, swipe scroller
+routing), and internals.
 
 ## MDMA — hardware debug board  →  `references/mdma.md`
 
