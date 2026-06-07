@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""mici — host-side CLI to see and drive the comma four (mici) UI.
+
+The agent runs THIS on the host. It hides all device plumbing: it ensures the
+on-device driver is deployed (only re-pushes when its content changes), picks a
+transport (SSH if the mici is reachable, else the MDMA serial link), runs the driver
+under the device venv, and for `capture` pulls the PNG back to a local path.
+
+Commands (coordinates are LANDSCAPE: lx 0..535, ly 0..239 — matching a screenshot):
+  mici capture [OUT.png]                # default OUT: /tmp/mici.png ; prints the path
+  mici tap LX LY [--hold S]
+  mici swipe LX1 LY1 LX2 LY2 [--dur S]
+  mici hold LX LY [--dur S]
+  mici run 'STEP; STEP; ...' [--outdir DIR]   # chain steps in ONE device call
+  mici run -                            # read chain script from stdin
+  mici shell 'CMD'                      # run an arbitrary cmd on the device (escape hatch)
+
+Chain steps (';' or newline separated, '#' comments): tap LX LY [HOLD],
+swipe LX1 LY1 LX2 LY2 [DUR], hold LX LY [DUR], wait S, capture [NAME].
+Captured PNGs are pulled to --outdir (default /tmp); each local path is
+printed. One transport setup + one venv start for the whole chain.
+
+Exit status is the device command's status. On capture, the local PNG path is the
+last line of stdout.
+"""
+import hashlib
+import os
+import subprocess
+import sys
+
+HOST = "comma@10.0.0.22"
+DEST = "/data/mici_ui.py"
+HASH_MARK = "/data/.mici_ui.sha"           # records the deployed driver's hash
+VENV_PY = "/usr/local/venv/bin/python"
+HERE = os.path.dirname(os.path.abspath(__file__))
+SRC = os.path.join(HERE, "mici_ui.py")
+MDMA = os.path.join(HERE, "mdma.py")  # sibling script in this skill
+SERIAL_BY_ID = "/dev/serial/by-id/usb-Microchip_Tech_USB2_Controller_Hub-if01"
+
+
+def _src_hash():
+    with open(SRC, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+# ---- transport detection ----
+
+def _ssh_ok():
+    return subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", HOST, "true"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def _mdma_ok():
+    return os.access(MDMA, os.X_OK) and os.path.exists(SERIAL_BY_ID)
+
+
+# ---- run a command on the device, return CompletedProcess (stdout bytes) ----
+
+def _run_ssh(cmd):
+    return subprocess.run(["ssh", HOST, cmd], stdout=subprocess.PIPE)
+
+
+def _run_mdma(cmd):
+    return subprocess.run([MDMA, "bash", cmd], stdout=subprocess.PIPE)
+
+
+# ---- deploy the driver if the on-device copy is stale ----
+
+def _ensure_deployed(transport):
+    want = _src_hash()
+    if transport == "ssh":
+        have = subprocess.run(
+            ["ssh", HOST, f"cat {HASH_MARK} 2>/dev/null"],
+            stdout=subprocess.PIPE,
+        ).stdout.decode().strip()
+        if have == want:
+            return
+        subprocess.run(["scp", "-q", SRC, f"{HOST}:{DEST}"], check=True)
+        subprocess.run(["ssh", HOST, f"printf %s {want} > {HASH_MARK}"], check=True)
+    else:  # mdma
+        have = _run_mdma(f"cat {HASH_MARK} 2>/dev/null").stdout.decode().strip()
+        if have == want:
+            return
+        import base64
+        b64 = base64.b64encode(open(SRC, "rb").read()).decode()
+        # write the file and stamp the hash, in one serial round-trip
+        script = f"echo {b64} | base64 -d > {DEST}; printf %s {want} > {HASH_MARK}"
+        r = _run_mdma(script)
+        if r.returncode != 0:
+            sys.exit("deploy over MDMA failed")
+
+
+def _pull(transport, remote, local):
+    if transport == "ssh":
+        subprocess.run(["scp", "-q", f"{HOST}:{remote}", local], check=True)
+    else:
+        import base64
+        b64 = _run_mdma(f"base64 -w0 {remote}").stdout
+        with open(local, "wb") as f:
+            f.write(base64.b64decode(b64))
+
+
+def _shq(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def main(argv):
+    if not argv:
+        print(__doc__)
+        return 2
+    cmd = argv[0]
+
+    if _ssh_ok():
+        transport = "ssh"
+    elif _mdma_ok():
+        transport = "mdma"
+    else:
+        sys.exit(f"mici unreachable: SSH to {HOST} failed and no MDMA adapter found")
+
+    if cmd == "shell":
+        run = _run_ssh if transport == "ssh" else _run_mdma
+        r = run(argv[1])
+        sys.stdout.buffer.write(r.stdout)
+        return r.returncode
+
+    _ensure_deployed(transport)
+    run = _run_ssh if transport == "ssh" else _run_mdma
+
+    if cmd == "capture":
+        local = argv[1] if len(argv) > 1 else "/tmp/mici.png"
+        remote = "/tmp/mici_cap.png"
+        dev_cmd = f"{VENV_PY} {DEST} capture {remote}"
+        r = run(dev_cmd)
+        sys.stdout.buffer.write(r.stdout)
+        if r.returncode != 0:
+            return r.returncode
+        _pull(transport, remote, local)
+        print(os.path.abspath(local))
+        return 0
+
+    # run: execute a chain script in ONE device invocation, pull back captures.
+    #   mici run 'tap 268 120; wait .6; tap 150 120; capture'
+    #   mici run -            (read script from stdin)
+    #   --outdir DIR          where to drop pulled PNGs (default /tmp)
+    if cmd == "run":
+        rest = argv[1:]
+        outdir = "/tmp"
+        if "--outdir" in rest:
+            i = rest.index("--outdir")
+            outdir = rest[i + 1]
+            rest = rest[:i] + rest[i + 2:]
+        script = sys.stdin.read() if (not rest or rest[0] == "-") else " ".join(rest)
+        dev_cmd = f"{VENV_PY} {DEST} run {_shq(script)}"
+        r = run(dev_cmd)
+        out = r.stdout.decode(errors="replace")
+        sys.stdout.write(out)
+        if r.returncode != 0:
+            return r.returncode
+        names = []
+        for line in out.splitlines():
+            if line.startswith("CAPTURES "):
+                names = line.split()[1:]
+        os.makedirs(outdir, exist_ok=True)
+        for name in names:
+            local = os.path.join(outdir, name)
+            _pull(transport, f"/tmp/mici_chain/{name}", local)
+            print(os.path.abspath(local))
+        return 0
+
+    # tap / swipe / hold: pass args straight through to the device driver
+    if cmd in ("tap", "swipe", "hold"):
+        dev_cmd = f"{VENV_PY} {DEST} " + " ".join(_shq(a) for a in argv)
+        r = run(dev_cmd)
+        sys.stdout.buffer.write(r.stdout)
+        return r.returncode
+
+    sys.exit(f"unknown command: {cmd}")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
