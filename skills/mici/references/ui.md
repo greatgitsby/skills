@@ -126,9 +126,24 @@ The host CLI (`scripts/mici`) shells out to the device and runs the on-device dr
   and rotates 270° to the upright 536×240 landscape image. No root / `/dev/mem`.
 - **Touch**: writes evdev multitouch protocol-B events to `/dev/input/event2`
   (`fts_ts`, world-writable). Native ranges X 0..240, Y 0..536. Landscape→native
-  transform `nx = 239 - ly, ny = lx` (empirically verified by tapping known targets).
-  The UI polls touch via raylib at 140 Hz and classifies tap vs scroll by velocity,
-  which is why swipes use stepped motion.
+  transform `nx = ly, ny = 535 - lx`. The touchscreen reports **180° rotated**
+  relative to the framebuffer, so the touch transform and the capture rotation are
+  independent. The UI polls touch via raylib at 140 Hz and classifies tap vs scroll by
+  velocity, which is why swipes use stepped motion.
+
+## Visualizing touches
+
+Set the **`ShowDebugInfo`** param and restart the UI to turn on its built-in touch
+overlay — a **red dot** at the latest touch, a **green→red fade trail** for the swipe
+path, an FPS counter, and red widget-bound rectangles:
+
+```bash
+$SKILL_DIR/scripts/mici shell 'printf 1 > /data/params/d/ShowDebugInfo'
+$SKILL_DIR/scripts/mici shell 'cd /data/openpilot && tools/op.sh start'   # restart openpilot
+```
+
+Set it to `0` and restart the UI to turn the overlays off. (The same toggle is "ui
+debug mode" under Settings → developer.)
 
 ## Maintaining this reference
 
@@ -136,5 +151,7 @@ The fragile parts live in `scripts/mici_ui.py`: the geometry constants
 (`NATIVE_W/H`, `land_to_native`, ABGR8888, the 270° rotation) and the `magic` socket
 protocol. If a future AGNOS/UI changes the panel resolution, framebuffer format,
 rotation, or the broker socket, re-verify by capturing, tapping a known on-screen
-target, and confirming the tap lands where the screenshot shows it. Editing
-`mici_ui.py` is enough — the host CLI auto-redeploys it by content hash.
+target (use the `ShowDebugInfo` touch overlay, see *Visualizing touches*), and
+confirming the tap lands where the screenshot shows it. The touch transform and the
+capture rotation are independent, so re-check them separately. Editing `mici_ui.py` is
+enough — the host CLI auto-redeploys it by content hash.

@@ -16,9 +16,10 @@ Coordinate transform (this is the thing to get right):
   All command coordinates are LANDSCAPE (lx in 0..535, ly in 0..239), matching what
   you see in a captured (rotated) screenshot. They are converted to native touch
   coordinates before injection:
-      nx = (NATIVE_W - 1) - ly      # 239 - ly
-      ny = lx
-  Verified empirically: a landscape tap lands where the screenshot shows it.
+      nx = ly
+      ny = (LAND_W - 1) - lx       # 535 - lx
+  The touchscreen reports 180 deg rotated relative to the framebuffer, so the touch
+  transform and the capture rotation are independent.
 
 Usage:
   mici_ui.py capture OUT.png            # save upright landscape (536x240) PNG
@@ -48,9 +49,13 @@ TOUCH_DEV = "/dev/input/event2"
 
 
 def land_to_native(lx, ly):
-    """Landscape (lx,ly) -> native touch (nx,ny). Display is native rotated 90 CW."""
-    nx = (NATIVE_W - 1) - ly
-    ny = lx
+    """Landscape (lx,ly) -> native touch (nx,ny). Display is native rotated 90 CW.
+
+    The touchscreen reports 180 deg rotated relative to the framebuffer, so we
+    pre-rotate the landscape point 180 (lx->535-lx, ly->239-ly) before the native
+    mapping, which simplifies to nx=ly, ny=(LAND_W-1)-lx."""
+    nx = ly
+    ny = (LAND_W - 1) - lx
     return max(0, min(NATIVE_W - 1, nx)), max(0, min(NATIVE_H - 1, ny))
 
 
