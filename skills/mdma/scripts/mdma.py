@@ -3,6 +3,7 @@
 # dependencies = ["pyusb"]
 # ///
 import argparse
+import base64
 import errno
 import fcntl
 import os
@@ -11,6 +12,7 @@ import select
 import sys
 import termios
 import time
+import zlib
 
 import usb.core
 
@@ -103,11 +105,8 @@ class Mdma:
   def serial(self):
     os.execvp("screen", ["screen", SERIAL_DEV, "115200"])
 
-  def profile_boot(self):
-    # device off for clean serial
-    self.power_off()
-
-    # open the serial device
+  def open_serial(self):
+    # open the serial device raw at 115200 8N1
     try:
       fd = os.open(SERIAL_DEV, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
     except OSError as e:
@@ -127,6 +126,138 @@ class Mdma:
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
     fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
     termios.tcflush(fd, termios.TCIFLUSH)
+    return fd
+
+  def _drain(self, fd):
+    while os.read(fd, 4096):
+      time.sleep(0.05)
+
+  def _read_until(self, fd, pattern, timeout):
+    """Read from fd until `pattern` (compiled regex) matches the accumulated
+    buffer or `timeout` elapses. Returns (buf, match_or_None)."""
+    buf = b""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+      if not select.select([fd], [], [], 0.25)[0]:
+        continue
+      data = os.read(fd, 4096)
+      if not data:
+        continue
+      buf += data.replace(b"\r\n", b"\n")
+      m = pattern.search(buf)
+      if m:
+        return buf, m
+    return buf, None
+
+  # serial console states we may land in: a login: prompt, a Password: prompt,
+  # or a live shell prompt (#/$). USERNAME/PASSWORD are the device defaults.
+  USERNAME = "comma"
+  PASSWORD = "comma"
+  LOGIN_RE = re.compile(rb"login:\s*$")
+  PASSWORD_RE = re.compile(rb"[Pp]assword:\s*$")
+  SHELL_RE = re.compile(rb"[#\$]\s*$")
+
+  def _ensure_login(self, fd, timeout=20.0):
+    """Get the serial console to a live shell prompt, logging in with the
+    device's default comma/comma credentials if it's sitting at login:."""
+    self._drain(fd)
+    os.write(fd, b"\n")
+    # figure out where we are
+    buf, m = self._read_until(fd, re.compile(rb"login:\s*$|[Pp]assword:\s*$|[#\$]\s*$"), 3.0)
+    if m is None:
+      raise SystemExit("no response from serial console (is the device booted?)")
+
+    if self.SHELL_RE.search(buf):
+      return  # already at a shell
+
+    if self.PASSWORD_RE.search(buf):
+      # stale password prompt — bail out to a fresh login by sending a newline
+      os.write(fd, b"\n")
+      self._read_until(fd, self.LOGIN_RE, 5.0)
+
+    # at this point we expect a login: prompt
+    os.write(fd, (self.USERNAME + "\n").encode())
+    _, m = self._read_until(fd, self.PASSWORD_RE, 5.0)
+    if m is None:
+      raise SystemExit("never reached a Password: prompt after sending username")
+    os.write(fd, (self.PASSWORD + "\n").encode())
+    _, m = self._read_until(fd, self.SHELL_RE, timeout)
+    if m is None:
+      raise SystemExit("login failed (wrong credentials or no shell prompt)")
+
+  def exec(self, script, timeout=30.0):
+    """Run a bash script on the device over the serial console and return its
+    output + exit code. The script may be an arbitrary multi-line program
+    (heredocs, embedded python3, quotes, etc.).
+
+    Wire protocol: the script is base64-encoded on the host so only a single line
+    ever crosses the line-oriented serial console (no quoting/heredoc hazards).
+    On the device it's decoded and run under bash, and its combined stdout+stderr
+    is piped through `gzip | base64` before crossing back — gzip typically shrinks
+    text/log output 5-10x, and 115200 baud (~7.5 KB/s effective) is the real
+    bottleneck, so compressing on the device is ~3x faster on large output. The
+    host decodes + gunzips, so the captured bytes are exact (no whitespace
+    munging). Begin/end sentinels frame the base64 blob; the script's own exit
+    code is recovered via bash ${PIPESTATUS[0]}.
+
+    Logs in with comma/comma if the console is at a login prompt. Requires
+    gzip + base64 on the device PATH (AGNOS has both)."""
+    fd = self.open_serial()
+    self._ensure_login(fd)
+    self._drain(fd)
+
+    # unique markers framing the base64'd, gzipped output blob.
+    beg = "__MDMA_BEG_837__"
+    end = "__MDMA_END_837__"
+
+    # device side: decode the script, run it under bash capturing stdout+stderr,
+    # compress + base64 the output, then emit the end marker with the SCRIPT's
+    # exit code (PIPESTATUS[0]), not gzip's/base64's. base64 -w0 = no line wraps.
+    b64 = base64.b64encode(script.encode()).decode()
+    # capture the script's exit code into a var on the SAME line as the pipeline
+    # (a bare `echo` afterward would reset PIPESTATUS before we read it).
+    line = (
+      f"echo {beg}; "
+      f"{{ printf %s {b64} | base64 -d | bash; }} 2>&1 | gzip -c | base64 -w0; rc=${{PIPESTATUS[0]}}; "
+      f"echo; echo {end}:$rc:\n"
+    )
+    os.write(fd, line.encode())
+
+    end_re = re.compile(rb"" + end.encode() + rb":(-?\d+):")
+    buf, m = self._read_until(fd, end_re, timeout)
+    os.close(fd)
+    if m is None:
+      raise SystemExit(f"timed out after {timeout}s waiting for command output")
+    return self._extract(buf, beg.encode(), end_re, m)
+
+  def _extract(self, buf, beg, end_re, end_match):
+    # the base64 blob lives between the begin marker's line and the end marker.
+    # the begin marker appears twice on the wire (the echoed command line + its
+    # own output); take everything after the LAST begin-marker newline so the
+    # echoed command line is excluded.
+    start = buf.rfind(beg)
+    nl = buf.find(b"\n", start)
+    start = nl + 1 if nl != -1 else len(buf)
+    blob = buf[start:end_match.start()]
+
+    # strip serial cruft (CRs, stray whitespace/newlines) from the base64, then
+    # decode + gunzip back to the exact device-side bytes.
+    blob = re.sub(rb"[^A-Za-z0-9+/=]", b"", blob)
+    code = int(end_match.group(1))
+    if blob:
+      try:
+        out = zlib.decompress(base64.b64decode(blob), wbits=16 + zlib.MAX_WBITS)
+      except Exception as e:
+        raise SystemExit(f"failed to decode device output ({e}); is gzip/base64 present on the device?")
+      sys.stdout.buffer.write(out)
+      sys.stdout.flush()
+    return code
+
+  def profile_boot(self):
+    # device off for clean serial
+    self.power_off()
+
+    fd = self.open_serial()
     while (data := os.read(fd, 4096)):
       time.sleep(0.1)
 
@@ -154,19 +285,36 @@ class Mdma:
         return
 
 
+def bash_script(args):
+  # script body comes from stdin ("-") or inline argv (joined as one line).
+  # both are base64-encoded and run under bash on the device, so multi-line
+  # scripts, heredocs, and embedded python3 all work verbatim.
+  if args.argv == ["-"] or (not args.argv and not sys.stdin.isatty()):
+    script = sys.stdin.read()
+  elif args.argv:
+    script = " ".join(args.argv)
+  else:
+    raise SystemExit("bash: provide a command inline, or pipe a script via '-'")
+  return Mdma().exec(script, timeout=args.timeout)
+
+
 if __name__ == "__main__":
   cmds = {
-    "reboot":       (lambda: Mdma().reboot(qdl=False), "reboot comma four into normal boot"),
-    "reboot-qdl":   (lambda: Mdma().reboot(qdl=True), "reboot comma four into QDL mode for flashing"),
-    "serial":       (lambda: Mdma().serial(), "open the MSM UART console with screen"),
-    "profile-boot": (lambda: Mdma().profile_boot(), "reboot comma four and profile boot time"),
+    "reboot":       (lambda a: Mdma().reboot(qdl=False), "reboot comma four into normal boot"),
+    "reboot-qdl":   (lambda a: Mdma().reboot(qdl=True), "reboot comma four into QDL mode for flashing"),
+    "serial":       (lambda a: Mdma().serial(), "open the MSM UART console with screen"),
+    "profile-boot": (lambda a: Mdma().profile_boot(), "reboot comma four and profile boot time"),
+    "bash":         (bash_script, "run a bash script on the device over serial and print its output"),
   }
 
   parser = argparse.ArgumentParser()
   parser.add_argument("--missing-ok", action="store_true", help="continue successfully when no MDMA is connected")
   subparsers = parser.add_subparsers(dest="command", required=True)
   for cmd, (_, hlp) in cmds.items():
-    subparsers.add_parser(cmd, help=hlp)
+    sp = subparsers.add_parser(cmd, help=hlp)
+    if cmd == "bash":
+      sp.add_argument("argv", nargs="*", help="the bash command to run inline; or '-' to read the script from stdin")
+      sp.add_argument("--timeout", type=float, default=30.0, help="seconds to wait for output (default 30)")
   if len(sys.argv) == 1:
     parser.print_help()
     raise SystemExit(0)
@@ -176,4 +324,6 @@ if __name__ == "__main__":
     print("MDMA not found.")
     raise SystemExit(0 if args.missing_ok else 1)
 
-  cmds[args.command][0]()
+  rc = cmds[args.command][0](args)
+  if isinstance(rc, int):
+    raise SystemExit(rc)
