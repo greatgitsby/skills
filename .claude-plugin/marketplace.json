@@ -7,8 +7,7 @@
     {
       "name": "greatgitsby-skills",
       "source": ".",
-      "description": "A collection of agent skills.",
-      "skills": "./skills"
+      "description": "A collection of agent skills."
     }
   ]
 }
