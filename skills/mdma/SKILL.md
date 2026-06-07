@@ -1,6 +1,18 @@
 ---
 name: mdma
-description: For comma.ai device development (comma four / mici, agnos-builder, openpilot), operate the MDMA — the mici debug and monitoring adapter, a wired hardware debug board — to do low-level things SSH and op.sh cannot. ONLY applies to a comma four physically wired to an MDMA adapter; if there is no MDMA connected (the script prints "MDMA not found."), this skill does not apply. Use whenever the user wants to power the SOC on/off or cut/cycle VIN power, force or drop the device into QDL mode (the un-brick path, e.g. "get it into QDL first" before flashing AGNOS or to recover a bricked board), open the MSM UART / serial console, or reboot-and-profile boot time — even if "MDMA" isn't named; the cue is physical power, QDL, serial, or power-on boot timing on a comma four wired to an MDMA. Not for: software-only access over SSH/op.sh, building AGNOS images, profiling openpilot/cereal inside a running system, or power/serial on non-comma hardware or a comma four with no MDMA attached.
+description: >-
+  For comma.ai device development (comma four / mici, agnos-builder, openpilot),
+  operate the MDMA — the mici debug and monitoring adapter, a wired hardware debug
+  board — to do low-level things SSH and op.sh cannot. ONLY applies to a comma four
+  physically wired to an MDMA adapter; if there is no MDMA connected (the script
+  prints "MDMA not found."), this skill does not apply. Use whenever the user wants
+  to power the SOC on/off or cut/cycle VIN power, force or drop the device into QDL
+  mode (the un-brick path, e.g. "get it into QDL first" before flashing AGNOS or to
+  recover a bricked board), open the MSM UART / serial console, or reboot-and-profile
+  boot time — even if "MDMA" isn't named; the cue is physical power, QDL, serial, or
+  power-on boot timing on a comma four wired to an MDMA. Not for: software-only access
+  over SSH/op.sh, building AGNOS images, profiling openpilot/cereal inside a running
+  system, or power/serial on non-comma hardware or a comma four with no MDMA attached.
 ---
 
 # MDMA — mici debug and monitoring adapter
