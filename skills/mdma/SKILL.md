@@ -1,11 +1,11 @@
 ---
 name: mdma
-description: For comma.ai device development (comma four / mici / comma 3X, agnos-builder, openpilot), operate the MDMA — the mici debug and monitoring adapter, a wired hardware debug board — to do low-level things SSH and op.sh cannot. ONLY applies to a comma four physically wired to an MDMA adapter; if there is no MDMA connected (the script prints "MDMA not found."), this skill does not apply. Use whenever the user wants to power the SOC on/off or cut/cycle VIN power, force or drop the device into QDL mode (the un-brick path, e.g. "get it into QDL first" before flashing AGNOS or to recover a bricked board), open the MSM UART / serial console, or reboot-and-profile boot time — even if "MDMA" isn't named; the cue is physical power, QDL, serial, or power-on boot timing on a comma four wired to an MDMA. Not for: software-only access over SSH/op.sh, building AGNOS images, profiling openpilot/cereal inside a running system, or power/serial on non-comma hardware or a comma four with no MDMA attached.
+description: For comma.ai device development (comma four / mici, agnos-builder, openpilot), operate the MDMA — the mici debug and monitoring adapter, a wired hardware debug board — to do low-level things SSH and op.sh cannot. ONLY applies to a comma four physically wired to an MDMA adapter; if there is no MDMA connected (the script prints "MDMA not found."), this skill does not apply. Use whenever the user wants to power the SOC on/off or cut/cycle VIN power, force or drop the device into QDL mode (the un-brick path, e.g. "get it into QDL first" before flashing AGNOS or to recover a bricked board), open the MSM UART / serial console, or reboot-and-profile boot time — even if "MDMA" isn't named; the cue is physical power, QDL, serial, or power-on boot timing on a comma four wired to an MDMA. Not for: software-only access over SSH/op.sh, building AGNOS images, profiling openpilot/cereal inside a running system, or power/serial on non-comma hardware or a comma four with no MDMA attached.
 ---
 
 # MDMA — mici debug and monitoring adapter
 
-The MDMA is a hardware debug adapter for low-level **comma four** (aka mici) and **comma 3X** development. It only works when a comma four is **physically wired to an MDMA adapter** — if no MDMA is connected, nothing here applies (the script prints `MDMA not found.`). It connects to the SOC over USB and a UART, and lets you:
+The MDMA is a hardware debug adapter for low-level **comma four** (aka mici) development. It only works when a comma four is **physically wired to an MDMA adapter** — if no MDMA is connected, nothing here applies (the script prints `MDMA not found.`). It connects to the SOC over USB and a UART, and lets you:
 
 - power the SOC on and off
 - force the SOC into **QDL mode** for un-brickable flashing
@@ -94,7 +94,7 @@ With no subcommand, the script prints help and exits 0.
 ## How it works (for debugging)
 
 - **Power / VIN** is toggled by writing a GPIO register over a USB control transfer to the Microchip "HFC" hub (`0424:704c`). `VIN_EN` is GPIO bit 92.
-- **QDL forcing**: on comma 3X / comma four, powering the *aux* USB ports up *before* VIN forces the SOC into QDL on boot. `reboot-qdl` does exactly this ordering; `reboot` powers VIN first instead.
+- **QDL forcing**: on comma four, powering the *aux* USB ports up *before* VIN forces the SOC into QDL on boot. `reboot-qdl` does exactly this ordering; `reboot` powers VIN first instead.
 - **Aux USB power** is toggled via `SET_FEATURE`/`CLEAR_FEATURE` (PORT_POWER) on the `0424:7002` and `0424:4002` hubs.
 - **`profile-boot`** opens the serial device raw at 115200 8N1, drains stale bytes, reboots, then prints each line prefixed with elapsed seconds, stopping when it sees a `login:`, `#`, or `$` prompt (`PROMPT_RE`).
 - **`bash`** opens the same raw serial device, drives the console to a shell — logging in with `comma`/`comma` if it lands on a `login:` prompt — then sends **one line**:
