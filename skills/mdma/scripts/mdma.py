@@ -285,7 +285,7 @@ class Mdma:
         return
 
 
-def exec_script(args):
+def bash_script(args):
   # script body comes from stdin ("-") or inline argv (joined as one line).
   # both are base64-encoded and run under bash on the device, so multi-line
   # scripts, heredocs, and embedded python3 all work verbatim.
@@ -294,7 +294,7 @@ def exec_script(args):
   elif args.argv:
     script = " ".join(args.argv)
   else:
-    raise SystemExit("exec: provide a command inline, or pipe a script via '-'")
+    raise SystemExit("bash: provide a command inline, or pipe a script via '-'")
   return Mdma().exec(script, timeout=args.timeout)
 
 
@@ -304,7 +304,7 @@ if __name__ == "__main__":
     "reboot-qdl":   (lambda a: Mdma().reboot(qdl=True), "reboot comma four into QDL mode for flashing"),
     "serial":       (lambda a: Mdma().serial(), "open the MSM UART console with screen"),
     "profile-boot": (lambda a: Mdma().profile_boot(), "reboot comma four and profile boot time"),
-    "exec":         (exec_script, "run a bash script on the device over serial and print its output"),
+    "bash":         (bash_script, "run a bash script on the device over serial and print its output"),
   }
 
   parser = argparse.ArgumentParser()
@@ -312,7 +312,7 @@ if __name__ == "__main__":
   subparsers = parser.add_subparsers(dest="command", required=True)
   for cmd, (_, hlp) in cmds.items():
     sp = subparsers.add_parser(cmd, help=hlp)
-    if cmd == "exec":
+    if cmd == "bash":
       sp.add_argument("argv", nargs="*", help="the bash command to run inline; or '-' to read the script from stdin")
       sp.add_argument("--timeout", type=float, default=30.0, help="seconds to wait for output (default 30)")
   if len(sys.argv) == 1:

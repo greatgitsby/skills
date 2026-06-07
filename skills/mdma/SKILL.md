@@ -39,7 +39,7 @@ Run from this skill's directory (or pass the full path to `scripts/mdma.py`):
 | `reboot` | Power-cycle the SOC into a **normal** boot. |
 | `reboot-qdl` | Power-cycle the SOC into **QDL mode** for flashing — the un-brick path. |
 | `serial` | Open the MSM UART console with `screen` at 115200 baud. |
-| `exec <cmd...>` / `exec -` | Run a bash script on the device **over serial** and print its stdout/stderr; exits with the script's exit code. Pass a one-liner inline, or `-` to read a multi-line script from stdin (heredocs, embedded `python3`, etc. all work). Output is gzip-compressed on the device for speed and is byte-exact/binary-safe. Logs in with the default `comma`/`comma` credentials if the console is at a `login:` prompt. |
+| `bash <cmd...>` / `bash -` | Run a bash script on the device **over serial** and print its stdout/stderr; exits with the script's exit code. Pass a one-liner inline, or `-` to read a multi-line script from stdin (heredocs, embedded `python3`, etc. all work). Output is gzip-compressed on the device for speed and is byte-exact/binary-safe. Logs in with the default `comma`/`comma` credentials if the console is at a `login:` prompt. |
 | `profile-boot` | Reboot into normal boot and stream the serial console with `[seconds.ms]` timestamps until the login/shell prompt appears. |
 
 ```bash
@@ -55,14 +55,14 @@ scripts/mdma.py serial
 # run a one-liner on the device over serial and capture the output.
 # quote the whole command so the host shell doesn't expand it first;
 # pipes, redirects, and ; all run on the device:
-scripts/mdma.py exec 'uname -a; df -h /data'
-scripts/mdma.py exec 'dmesg | tail -n 20'
+scripts/mdma.py bash 'uname -a; df -h /data'
+scripts/mdma.py bash 'dmesg | tail -n 20'
 
 # run a multi-line script from stdin (use '-'). heredocs and embedded
 # python3 work verbatim — the body is base64'd over the wire, so no quoting
 # or line-by-line hazards. this is the preferred way to run anything
 # non-trivial (no temp files needed):
-scripts/mdma.py exec - <<'EOF'
+scripts/mdma.py bash - <<'EOF'
 for svc in boardd pandad; do
   echo "== $svc =="
   pgrep -a "$svc" || echo "(not running)"
@@ -74,7 +74,7 @@ PY
 EOF
 
 # bump the timeout for slow scripts (default 30s):
-scripts/mdma.py exec --timeout 120 'sleep 60; echo woke up'
+scripts/mdma.py bash --timeout 120 'sleep 60; echo woke up'
 
 # reboot and print a timestamped boot trace, returns at the prompt
 scripts/mdma.py profile-boot
@@ -97,7 +97,7 @@ With no subcommand, the script prints help and exits 0.
 - **QDL forcing**: on comma 3X / comma four, powering the *aux* USB ports up *before* VIN forces the SOC into QDL on boot. `reboot-qdl` does exactly this ordering; `reboot` powers VIN first instead.
 - **Aux USB power** is toggled via `SET_FEATURE`/`CLEAR_FEATURE` (PORT_POWER) on the `0424:7002` and `0424:4002` hubs.
 - **`profile-boot`** opens the serial device raw at 115200 8N1, drains stale bytes, reboots, then prints each line prefixed with elapsed seconds, stopping when it sees a `login:`, `#`, or `$` prompt (`PROMPT_RE`).
-- **`exec`** opens the same raw serial device, drives the console to a shell — logging in with `comma`/`comma` if it lands on a `login:` prompt — then sends **one line**:
+- **`bash`** opens the same raw serial device, drives the console to a shell — logging in with `comma`/`comma` if it lands on a `login:` prompt — then sends **one line**:
   `echo <BEG>; { printf %s <b64> | base64 -d | bash; } 2>&1 | gzip -c | base64 -w0; rc=${PIPESTATUS[0]}; echo; echo <END>:$rc:`
   - **Outbound (host→device):** the whole script is base64-encoded on the host, so only a single line crosses the line-oriented serial link — arbitrary multi-line scripts, heredocs, and embedded `python3` survive with no quoting or line-timing hazards.
   - **Inbound (device→host):** the script's combined stdout+stderr is **gzipped then base64'd on the device** before crossing back. 115200 baud is only ~7.5 KB/s effective and *is* the bottleneck, so compressing on the device is the speed win — ~3x on dmesg-like text, up to ~7x on highly compressible output. The host strips non-base64 cruft, base64-decodes, and gunzips, so the captured bytes are **exact and binary-safe** (no whitespace munging; raw bytes 0x00–0xFF round-trip).
@@ -116,6 +116,6 @@ QDL flashing is the un-brickable recovery/flash path. The general sequence (driv
 
 ## Maintaining this skill
 
-`scripts/mdma.py` started as a **copy** of `agnos-builder/scripts/mdma.py`, but this copy has since diverged: the `exec` command (serial-console command execution with auto-login) is **skill-only** and does not exist upstream. When re-syncing after upstream changes, don't blindly overwrite — merge upstream changes in and keep the `exec` machinery: the `Mdma` methods `open_serial`, `_drain`, `_read_until`, `_ensure_login`, `exec`, `_extract`; the module-level `exec_script` arg resolver; the `zlib`/`base64` imports; and the `exec` subparser wiring.
+`scripts/mdma.py` started as a **copy** of `agnos-builder/scripts/mdma.py`, but this copy has since diverged: the `bash` command (serial-console command execution with auto-login) is **skill-only** and does not exist upstream. When re-syncing after upstream changes, don't blindly overwrite — merge upstream changes in and keep the `bash` machinery: the `Mdma` methods `open_serial`, `_drain`, `_read_until`, `_ensure_login`, `exec`, `_extract`; the module-level `bash_script` arg resolver; the `zlib`/`base64` imports; and the `bash` subparser wiring.
 
 Then re-read this SKILL.md against the new command table / behavior and update as needed.
