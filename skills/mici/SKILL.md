@@ -62,9 +62,14 @@ $SKILL_DIR/scripts/mdma.py bash 'uname -a' # run a command over serial, no netwo
 $SKILL_DIR/scripts/mdma.py profile-boot    # timestamped boot trace
 ```
 
+**QDL prerequisite:** forcing QDL needs an **aux USB-C cable looped from the dev
+board's aux port → the comma four's USB-C port** (the SOC then enumerates as
+`3801:9008` on Bus 2). Without it QDL never appears. See the flashing-flow section
+of `references/mdma.md` for the full setup + the hands-free flash loop.
+
 **See `references/mdma.md`** for the full command table, `bash -` multi-line/stdin
-usage, `--missing-ok`, the flashing flow, and how it works (VIN/QDL GPIO, serial
-protocol).
+usage, `--missing-ok`, the flashing flow (incl. **required aux-cable setup** and the
+hands-free QDL→flash→reboot loop), and how it works (VIN/QDL GPIO, serial protocol).
 
 > The `scripts/mdma.py bash` command is also the no-network transport the UI CLI
 > falls back to — so the two areas share the same serial link to the device.
