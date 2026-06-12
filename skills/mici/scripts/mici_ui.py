@@ -31,6 +31,7 @@ import argparse
 import array
 import ctypes
 import ctypes.util
+import glob
 import mmap
 import os
 import socket
@@ -45,7 +46,9 @@ LAND_W = NATIVE_H   # 536
 LAND_H = NATIVE_W   # 240
 
 DRM_SOCK = "/tmp/drmfd.sock"
-TOUCH_DEV = "/dev/input/event2"
+# Touch is on the 894000 i2c bus; this by-path symlink is stable across kernels
+# (eventN differs: event2 legacy, event0 mainline).
+TOUCH_DEV = next(iter(glob.glob("/dev/input/by-path/*894000.i2c-event")), "/dev/input/event2")
 
 
 def land_to_native(lx, ly):
