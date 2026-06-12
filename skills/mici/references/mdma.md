@@ -109,6 +109,39 @@ QDL flashing is the un-brickable recovery/flash path. The general sequence (driv
 2. Run the QDL flasher (e.g. `qdl` / the agnos-builder flash script) to write images.
 3. `scripts/mdma.py reboot` — boot the freshly flashed system.
 
+### Required hardware setup for QDL — the aux cable
+
+**QDL will never enumerate unless the SOC's aux USB is physically wired to the host.** On the MDMA DESK board this is a separate **aux USB-C connector** (the one *not* labeled `UFP`; `UFP` is the host/control+serial uplink). You must loop a USB-C cable:
+
+> **dev board aux USB-C  →  the comma four's USB-C port**
+
+The board bridges that aux port to the host through its **USB3 hub `0424:7002` (Bus 2)**. The `aux("on")` step in `reboot`/`reboot-qdl` powers that hub's ports; the SOC then presents its aux USB *in device mode only while entering QDL*, so it enumerates as `3801:9008` on **Bus 2** at the QDL moment. Leave this cable plugged — once set up, the entire flash loop runs hands-free from the host with no cable touching.
+
+Verify the path before flashing:
+
+```bash
+# aux cable connected + a QDL force in progress → SOC shows here:
+lsusb -d 3801:9008   # "Qualcomm ... MSM QUSB_BULK" on Bus 002 == QDL is live
+```
+
+Diagnosing a missing/wrong aux connection (control-transfer probes against the hubs):
+- The QDL path is the **`0424:7002` hub on Bus 2**. A cable in the wrong port enumerates as `3801:ddcc panda` on the **`0424:4002` hub (Bus 1)** instead — that's the panda USB2 path and never triggers QDL.
+- 7002 is a **SuperSpeed hub** (bcdUSB 0x0320): its port-power bit is `wPortStatus` **bit 9 (0x200)**, *not* the USB2 bit 8. Reading bit 8 falsely shows "unpowered." With the aux cable absent the ports read **powered, `connected=False`** — that empty-but-powered state is the tell that the aux cable isn't plugged.
+
+### Hands-free flash loop (aux cable stays plugged)
+
+```bash
+scripts/mdma.py reboot-qdl                 # into QDL (verify: lsusb -d 3801:9008 on Bus 2)
+( cd /path/to/vamOS && ./vamos flash kernel )   # flash boot_a
+scripts/mdma.py reboot                      # VIN-first; boots through the momentary
+                                            # QDL flicker into the flashed kernel
+```
+
+Gotchas observed:
+- **`reboot-qdl` doesn't always cut VIN.** It returns exit 0 but sometimes no-ops the power cut — the device never power-cycles and just stays on its current boot. Confirm the cut by checking that **uptime reset** (`scripts/mdma.py bash 'cut -d" " -f1 /proc/uptime'` should drop to single digits). If uptime kept climbing, re-issue. A re-enumeration of the MDMA hubs (fresh `lsusb` device numbers) tends to restore a working power toggle.
+- After a firehose reset (post-flash) the device often re-appears in **QDL**; a normal `scripts/mdma.py reboot` (VIN-first) is what boots it out into the flashed system. With the aux cable plugged you may see a brief `3801:9008` flicker on the reset edge before it proceeds to normal boot — that's expected.
+- To make QDL entry robust, drive the aux-before-VIN sequence and then **verify** by polling for `3801:9008` / the 7002 port `connected` bit, retrying if it didn't latch, rather than trusting `reboot-qdl`'s exit code.
+
 ## Maintaining this reference
 
 `scripts/mdma.py` started as a **copy** of `agnos-builder/scripts/mdma.py`, but this copy has since diverged: the `bash` command (serial-console command execution with auto-login) is **skill-only** and does not exist upstream. When re-syncing after upstream changes, don't blindly overwrite — merge upstream changes in and keep the `bash` machinery: the `Mdma` methods `open_serial`, `_drain`, `_read_until`, `_ensure_login`, `exec`, `_extract`; the module-level `bash_script` arg resolver; the `zlib`/`base64` imports; and the `bash` subparser wiring.
