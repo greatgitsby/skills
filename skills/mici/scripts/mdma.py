@@ -132,9 +132,20 @@ class Mdma:
     while os.read(fd, 4096):
       time.sleep(0.05)
 
+  # ANSI CSI / bracketed-paste escapes (e.g. \x1b[?2004h around a prompt). The
+  # systemd *emergency shell* wraps its prompt in these, so the raw bytes end in
+  # `...#\x1b[?2004h` — a naked `[#\$]\s*$` prompt regex never matches and login
+  # detection wrongly reports "no response". We strip these before prompt-matching.
+  ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
   def _read_until(self, fd, pattern, timeout):
     """Read from fd until `pattern` (compiled regex) matches the accumulated
-    buffer or `timeout` elapses. Returns (buf, match_or_None)."""
+    buffer or `timeout` elapses. Returns (raw_buf, match_or_None).
+
+    Matching is done against an ANSI/bracketed-paste-stripped view of the
+    buffer so prompt regexes survive escape sequences (the emergency shell's
+    `\x1b[?2004h` paste markers), but the *raw* buffer is returned so callers
+    like `exec` can decode the verbatim device bytes."""
     buf = b""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -144,7 +155,7 @@ class Mdma:
       if not data:
         continue
       buf += data.replace(b"\r\n", b"\n")
-      m = pattern.search(buf)
+      m = pattern.search(self.ANSI_RE.sub(b"", buf))
       if m:
         return buf, m
     return buf, None
@@ -167,10 +178,13 @@ class Mdma:
     if m is None:
       raise SystemExit("no response from serial console (is the device booted?)")
 
-    if self.SHELL_RE.search(buf):
+    # strip escapes before re-testing which prompt we landed on (the emergency
+    # shell wraps its prompt in bracketed-paste markers — see ANSI_RE).
+    view = self.ANSI_RE.sub(b"", buf)
+    if self.SHELL_RE.search(view):
       return  # already at a shell
 
-    if self.PASSWORD_RE.search(buf):
+    if self.PASSWORD_RE.search(view):
       # stale password prompt — bail out to a fresh login by sending a newline
       os.write(fd, b"\n")
       self._read_until(fd, self.LOGIN_RE, 5.0)
@@ -231,6 +245,13 @@ class Mdma:
     return self._extract(buf, beg.encode(), end_re, m)
 
   def _extract(self, buf, beg, end_re, end_match):
+    # NOTE: end_match came from _read_until, whose offsets index an
+    # ANSI-stripped view of the buffer, not the raw bytes we slice here — so we
+    # re-locate the end marker in the raw buffer and use the LAST occurrence.
+    end_raw = None
+    for end_raw in end_re.finditer(buf):
+      pass
+
     # the base64 blob lives between the begin marker's line and the end marker.
     # the begin marker appears twice on the wire (the echoed command line + its
     # own output); take everything after the LAST begin-marker newline so the
@@ -238,12 +259,16 @@ class Mdma:
     start = buf.rfind(beg)
     nl = buf.find(b"\n", start)
     start = nl + 1 if nl != -1 else len(buf)
-    blob = buf[start:end_match.start()]
+    blob = buf[start:end_raw.start() if end_raw else len(buf)]
 
-    # strip serial cruft (CRs, stray whitespace/newlines) from the base64, then
+    # strip ANSI/bracketed-paste escapes FIRST — the emergency shell injects
+    # them (e.g. \x1b[?2004l) and their interior chars ("2004", "h", "l") are
+    # base64-legal, so they'd otherwise leak into and corrupt the blob. Then
+    # drop remaining serial cruft (CRs, stray whitespace/newlines) and
     # decode + gunzip back to the exact device-side bytes.
+    blob = self.ANSI_RE.sub(b"", blob)
     blob = re.sub(rb"[^A-Za-z0-9+/=]", b"", blob)
-    code = int(end_match.group(1))
+    code = int((end_raw or end_match).group(1))
     if blob:
       try:
         out = zlib.decompress(base64.b64decode(blob), wbits=16 + zlib.MAX_WBITS)
