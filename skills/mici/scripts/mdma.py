@@ -24,6 +24,12 @@ USB_REQ_SET_FEATURE = 3
 USB_PORT_POWER = 8
 
 
+class _Transient(Exception):
+  """A serial round-trip failure worth one automatic retry (idle console,
+  dropped/garbled/truncated frame). Distinct from hard SystemExit failures
+  like a wrong password or a missing adapter."""
+
+
 class Pins:
   HFC_VID = 0x0424
   HFC_PID = 0x704C
@@ -138,17 +144,26 @@ class Mdma:
   # detection wrongly reports "no response". We strip these before prompt-matching.
   ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
-  def _read_until(self, fd, pattern, timeout):
+  def _read_until(self, fd, pattern, timeout, nudge=None):
     """Read from fd until `pattern` (compiled regex) matches the accumulated
     buffer or `timeout` elapses. Returns (raw_buf, match_or_None).
 
     Matching is done against an ANSI/bracketed-paste-stripped view of the
     buffer so prompt regexes survive escape sequences (the emergency shell's
     `\x1b[?2004h` paste markers), but the *raw* buffer is returned so callers
-    like `exec` can decode the verbatim device bytes."""
+    like `exec` can decode the verbatim device bytes.
+
+    If `nudge` (bytes) is given, it's re-sent to the device every ~1.5 s while
+    waiting. The serial getty / emergency shell sometimes sits idle and emits
+    nothing until poked, so a single up-front newline can be silently dropped;
+    re-nudging wakes it without depending on perfect timing."""
     buf = b""
     deadline = time.monotonic() + timeout
+    next_nudge = time.monotonic() + 1.5
     while time.monotonic() < deadline:
+      if nudge is not None and time.monotonic() >= next_nudge:
+        os.write(fd, nudge)
+        next_nudge = time.monotonic() + 1.5
       if not select.select([fd], [], [], 0.25)[0]:
         continue
       data = os.read(fd, 4096)
@@ -167,14 +182,20 @@ class Mdma:
   LOGIN_RE = re.compile(rb"login:\s*$")
   PASSWORD_RE = re.compile(rb"[Pp]assword:\s*$")
   SHELL_RE = re.compile(rb"[#\$]\s*$")
+  # How long to nudge for a prompt before declaring the console dead. An idle
+  # serial getty / emergency shell can take several seconds to start echoing.
+  ANY_PROMPT_TIMEOUT = 12.0
 
   def _ensure_login(self, fd, timeout=20.0):
     """Get the serial console to a live shell prompt, logging in with the
     device's default comma/comma credentials if it's sitting at login:."""
-    self._drain(fd)
-    os.write(fd, b"\n")
-    # figure out where we are
-    buf, m = self._read_until(fd, re.compile(rb"login:\s*$|[Pp]assword:\s*$|[#\$]\s*$"), 3.0)
+    # Don't pre-drain: the prompt may already be sitting in the buffer, and an
+    # idle getty/emergency shell can take several seconds (or a few nudges) to
+    # echo. Nudge with newlines for up to ANY_PROMPT_TIMEOUT s rather than
+    # firing one \n and giving up after 3 s — that 3 s window was the dominant
+    # "no response from serial console" false negative.
+    any_prompt = re.compile(rb"login:\s*$|[Pp]assword:\s*$|[#\$]\s*$")
+    buf, m = self._read_until(fd, any_prompt, self.ANY_PROMPT_TIMEOUT, nudge=b"\n")
     if m is None:
       raise SystemExit("no response from serial console (is the device booted?)")
 
@@ -199,7 +220,7 @@ class Mdma:
     if m is None:
       raise SystemExit("login failed (wrong credentials or no shell prompt)")
 
-  def exec(self, script, timeout=30.0):
+  def exec(self, script, timeout=30.0, _tries=2):
     """Run a bash script on the device over the serial console and return its
     output + exit code. The script may be an arbitrary multi-line program
     (heredocs, embedded python3, quotes, etc.).
@@ -211,69 +232,105 @@ class Mdma:
     text/log output 5-10x, and 115200 baud (~7.5 KB/s effective) is the real
     bottleneck, so compressing on the device is ~3x faster on large output. The
     host decodes + gunzips, so the captured bytes are exact (no whitespace
-    munging). Begin/end sentinels frame the base64 blob; the script's own exit
-    code is recovered via bash ${PIPESTATUS[0]}.
+    munging). The device frames the blob with a per-call nonce marker and emits
+    the blob's exact byte count, so the host slices it precisely and verifies it
+    arrived whole; the script's own exit code rides back via ${PIPESTATUS[0]}.
 
-    Logs in with comma/comma if the console is at a login prompt. Requires
-    gzip + base64 on the device PATH (AGNOS has both)."""
-    fd = self.open_serial()
-    self._ensure_login(fd)
-    self._drain(fd)
+    Transient serial failures (idle console, a dropped/garbled frame) are
+    retried once with a fresh login. Logs in with comma/comma if the console is
+    at a login prompt. Requires gzip + base64 on the device PATH (AGNOS has
+    both)."""
+    last_err = None
+    for attempt in range(_tries):
+      fd = self.open_serial()
+      try:
+        self._ensure_login(fd)
+        self._drain(fd)
+        return self._exec_once(fd, script, timeout)
+      except _Transient as e:
+        last_err = e
+      finally:
+        os.close(fd)
+    raise SystemExit(str(last_err))
 
-    # unique markers framing the base64'd, gzipped output blob.
-    beg = "__MDMA_BEG_837__"
-    end = "__MDMA_END_837__"
+  # A per-call nonce makes the framing immune to the command line the device
+  # echoes back: the host sends the marker as two shell args joined at runtime
+  # (`printf %s%s MDMA_<tag>_ <nonce>`), so the *concatenated* token only ever
+  # appears in real output, never in the echoed command. The old fixed
+  # `__MDMA_BEG_837__` literal appeared verbatim in the echo, and a drained/
+  # clipped echo would make rfind() land inside it and pull the base64 of the
+  # input script into the blob — the dominant base64-corruption failure.
+  def _exec_once(self, fd, script, timeout):
+    nonce = self._nonce()
+    beg = f"MDMABEG{nonce}".encode()
+    end = f"MDMAEND{nonce}".encode()
 
-    # device side: decode the script, run it under bash capturing stdout+stderr,
-    # compress + base64 the output, then emit the end marker with the SCRIPT's
-    # exit code (PIPESTATUS[0]), not gzip's/base64's. base64 -w0 = no line wraps.
+    # device side: decode the script, run under bash capturing stdout+stderr,
+    # gzip+base64 it into a var, then print the begin marker, the blob's exact
+    # length, the blob, and the end marker carrying the SCRIPT's exit code
+    # (PIPESTATUS[0]). Markers are assembled from fragments via printf so the
+    # full token never appears in the echoed command line. base64 -w0 = no wrap.
     b64 = base64.b64encode(script.encode()).decode()
-    # capture the script's exit code into a var on the SAME line as the pipeline
-    # (a bare `echo` afterward would reset PIPESTATUS before we read it).
+    # The script's exit code must be captured INSIDE the command substitution:
+    # ${PIPESTATUS[0]} read after `out=$(...)` would reflect the assignment's
+    # own pipeline (always 0), not the script's. So stash rc into a file inside
+    # the subshell and read it back out afterward.
+    rcf = f"/tmp/.mdma_rc_{nonce}"
     line = (
-      f"echo {beg}; "
-      f"{{ printf %s {b64} | base64 -d | bash; }} 2>&1 | gzip -c | base64 -w0; rc=${{PIPESTATUS[0]}}; "
-      f"echo; echo {end}:$rc:\n"
+      "out=$({ printf %s " + b64 + " | base64 -d | bash; echo $? > "
+      + rcf + "; } 2>&1 | gzip -c | base64 -w0); "
+      f"rc=$(cat {rcf}); rm -f {rcf}; "
+      f"printf 'MDMABEG%s:%s:\\n' {nonce} \"${{#out}}\"; "
+      "printf '%s\\n' \"$out\"; "
+      f"printf 'MDMAEND%s:%s:\\n' {nonce} \"$rc\"\n"
     )
     os.write(fd, line.encode())
 
-    end_re = re.compile(rb"" + end.encode() + rb":(-?\d+):")
+    # end marker carries the exit code: MDMAEND<nonce>:<rc>:
+    end_re = re.compile(re.escape(end) + rb":(-?\d+):")
     buf, m = self._read_until(fd, end_re, timeout)
-    os.close(fd)
     if m is None:
-      raise SystemExit(f"timed out after {timeout}s waiting for command output")
-    return self._extract(buf, beg.encode(), end_re, m)
+      raise _Transient(f"timed out after {timeout}s waiting for command output")
+    return self._extract(buf, beg, end, end_re)
 
-  def _extract(self, buf, beg, end_re, end_match):
-    # NOTE: end_match came from _read_until, whose offsets index an
-    # ANSI-stripped view of the buffer, not the raw bytes we slice here — so we
-    # re-locate the end marker in the raw buffer and use the LAST occurrence.
-    end_raw = None
-    for end_raw in end_re.finditer(buf):
+  def _nonce(self):
+    # 8 hex chars; avoids os.urandom-free environments and needs no RNG seed.
+    return "%08x" % (id(object()) & 0xFFFFFFFF)
+
+  def _extract(self, buf, beg, end, end_re):
+    # the begin marker carries the blob's exact byte length: MDMABEG<nonce>:<n>:
+    beg_re = re.compile(re.escape(beg) + rb":(\d+):")
+    bm = None
+    for bm in beg_re.finditer(buf):
       pass
+    em = None
+    for em in end_re.finditer(buf):
+      pass
+    if bm is None or em is None:
+      raise _Transient("framing markers missing from device output (garbled frame)")
+    code = int(em.group(1))
+    want = int(bm.group(1))
 
-    # the base64 blob lives between the begin marker's line and the end marker.
-    # the begin marker appears twice on the wire (the echoed command line + its
-    # own output); take everything after the LAST begin-marker newline so the
-    # echoed command line is excluded.
-    start = buf.rfind(beg)
-    nl = buf.find(b"\n", start)
-    start = nl + 1 if nl != -1 else len(buf)
-    blob = buf[start:end_raw.start() if end_raw else len(buf)]
-
-    # strip ANSI/bracketed-paste escapes FIRST — the emergency shell injects
-    # them (e.g. \x1b[?2004l) and their interior chars ("2004", "h", "l") are
-    # base64-legal, so they'd otherwise leak into and corrupt the blob. Then
-    # drop remaining serial cruft (CRs, stray whitespace/newlines) and
-    # decode + gunzip back to the exact device-side bytes.
-    blob = self.ANSI_RE.sub(b"", blob)
+    # blob is everything between the begin marker's line and the end marker.
+    nl = buf.find(b"\n", bm.end())
+    start = nl + 1 if nl != -1 else bm.end()
+    raw = buf[start:em.start()]
+    # strip ANSI/bracketed-paste escapes FIRST (emergency shell injects e.g.
+    # \x1b[?2004l whose interior "2004"/"h"/"l" are base64-legal), then drop
+    # serial cruft (CRs, stray newlines/spaces) to leave only the base64 blob.
+    blob = self.ANSI_RE.sub(b"", raw)
     blob = re.sub(rb"[^A-Za-z0-9+/=]", b"", blob)
-    code = int((end_raw or end_match).group(1))
+
+    # length check: if what arrived doesn't match the count the device computed,
+    # the frame was truncated/contaminated — retry rather than decode garbage.
+    if len(blob) != want:
+      raise _Transient(f"blob length mismatch (got {len(blob)}, device sent {want}); frame truncated")
+
     if blob:
       try:
         out = zlib.decompress(base64.b64decode(blob), wbits=16 + zlib.MAX_WBITS)
       except Exception as e:
-        raise SystemExit(f"failed to decode device output ({e}); is gzip/base64 present on the device?")
+        raise _Transient(f"failed to decode device output ({e})")
       sys.stdout.buffer.write(out)
       sys.stdout.flush()
     return code
