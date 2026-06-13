@@ -34,7 +34,7 @@ Run from the skill's directory (or pass the full path to `scripts/mdma.py`):
 | `reboot` | Power-cycle the SOC into a **normal** boot. |
 | `reboot-qdl` | Power-cycle the SOC into **QDL mode** for flashing — the un-brick path. |
 | `serial` | Open the MSM UART console with `screen` at 115200 baud. |
-| `bash <cmd...>` / `bash -` | Run a bash script on the device **over serial** and print its stdout/stderr; exits with the script's exit code. Pass a one-liner inline, or `-` to read a multi-line script from stdin (heredocs, embedded `python3`, etc. all work). Output is gzip-compressed on the device for speed and is byte-exact/binary-safe. Logs in with the default `comma`/`comma` credentials if the console is at a `login:` prompt. |
+| `bash <cmd...>` / `bash -` | Run a bash script on the device **over serial** and print its stdout/stderr; exits with the script's exit code. Pass a one-liner inline, or `-` to read a multi-line script from stdin (heredocs, embedded `python3`, etc. all work). Output is gzip-compressed on the device for speed and is byte-exact/binary-safe. Logs in with the default `comma`/`comma` credentials if the console is at a `login:` prompt. `--wait SECONDS` waits for a *booting* device to reach a usable shell before running (default 0 = fail fast); `--timeout SECONDS` bounds how long to wait for the command's output (default 30). |
 | `profile-boot` | Reboot into normal boot and stream the serial console with `[seconds.ms]` timestamps until the login/shell prompt appears. |
 
 ```bash
@@ -71,6 +71,10 @@ EOF
 # bump the timeout for slow scripts (default 30s):
 scripts/mdma.py bash --timeout 120 'sleep 60; echo woke up'
 
+# wait for a booting device to come up, then run (e.g. right after a reboot):
+scripts/mdma.py reboot
+scripts/mdma.py bash --wait 120 'uname -r; cut -d" " -f1 /proc/uptime'
+
 # reboot and print a timestamped boot trace, returns at the prompt
 scripts/mdma.py profile-boot
 ```
@@ -99,6 +103,7 @@ With no subcommand, the script prints help and exits 0.
   - **Nonce markers + length, not a fixed sentinel:** the markers are built per-call from a random nonce, and the host sends them as `printf` *format + arg* (`printf 'MDMABEG%s…' <nonce>`) so the **concatenated** token (`MDMABEG<nonce>`) only ever appears in real output — never in the command line the console echoes back. The begin marker also carries the blob's exact byte count; the host slices between the markers and **verifies the length matches** before decoding. A fixed literal sentinel (the old `__MDMA_BEG_837__`) appeared verbatim in the echoed command, so a clipped/drained echo could make the host slice the *input* base64 into the output blob — the dominant base64-corruption failure. The nonce + length framing eliminates it and makes any truncated frame self-detecting.
   - **Exit code:** the script's bash exit is captured **inside** the command substitution (`echo $? > /tmp/.mdma_rc_<nonce>`); reading `${PIPESTATUS[0]}` *after* `out=$(…)` would reflect the assignment's own pipeline (always 0), not the script's. `rc` rides back in the end marker and becomes the `bash` subcommand's process exit code. The tiny rc temp file is removed each call.
   - **Reliability:** prompt detection nudges the console with newlines for up to ~12 s (an idle serial getty / emergency shell can sit silent until poked and may take several seconds to echo), instead of firing one newline and giving up after 3 s — that short window was the dominant **"no response from serial console"** false negative. A transient round-trip failure (garbled/truncated frame, length mismatch, decode error) is **retried once** with a fresh login; a genuinely dead console fails cleanly after the prompt window with "no response from serial console". *Note:* during early kernel bring-up the device-side console may stop servicing the UART entirely — that's a device state no host retry can fix; reboot to recover.
+  - **`--wait` (boot-wait):** a *booting* device can't be detected by a prompt regex alone — the UART **replays buffered serial input** as it boots (including this tool's own prior command frames and stale `root@none:~#` prompts), so a naive prompt match fires on residue, not a live shell, and the command then gets shredded by ongoing boot spew. `--wait SECONDS` instead waits for the console to go **quiet** (boot output stopped for `QUIESCE_IDLE` s), then proves a live shell with a **random-token `echo` handshake** that replayed residue can't fake; it loops until the handshake passes or the deadline. This is what makes `reboot` immediately followed by `bash --wait` reliable across the device's variable (≈5–45 s) boot time.
   - This runs over the **serial console**, not SSH — works with no network, but the device must be booted to a login/shell prompt (not QDL or mid-boot) and needs `gzip`/`base64`/`bash` on PATH (AGNOS has all three).
   - **Emergency / maintenance shell:** if the device drops to the systemd emergency shell (e.g. a failed `nofail`-less mount during development), the console lands directly on a `root@…#` shell with **no `login:` prompt**. That shell turns on **bracketed-paste mode**, wrapping its prompt and every echoed line in `\x1b[?2004h`/`\x1b[?2004l` escape sequences. `bash` is resilient to this: prompt detection matches against an ANSI-stripped view of the serial buffer (`ANSI_RE`), and `_extract` strips those escapes before base64-decoding so their base64-legal interior bytes (`2004`, `h`, `l`) can't corrupt the output blob. So `bash` works at the emergency shell exactly as it does at a normal login.
 

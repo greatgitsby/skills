@@ -135,8 +135,11 @@ class Mdma:
     return fd
 
   def _drain(self, fd):
-    while os.read(fd, 4096):
-      time.sleep(0.05)
+    # select-gated so it never blocks if the device happens to be mid-output
+    # (the fd is in blocking mode, so a bare os.read could stall).
+    while select.select([fd], [], [], 0.05)[0]:
+      if not os.read(fd, 4096):
+        break
 
   # ANSI CSI / bracketed-paste escapes (e.g. \x1b[?2004h around a prompt). The
   # systemd *emergency shell* wraps its prompt in these, so the raw bytes end in
@@ -144,7 +147,7 @@ class Mdma:
   # detection wrongly reports "no response". We strip these before prompt-matching.
   ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
-  def _read_until(self, fd, pattern, timeout, nudge=None):
+  def _read_until(self, fd, pattern, timeout, nudge=None, idle_reset=False):
     """Read from fd until `pattern` (compiled regex) matches the accumulated
     buffer or `timeout` elapses. Returns (raw_buf, match_or_None).
 
@@ -156,7 +159,12 @@ class Mdma:
     If `nudge` (bytes) is given, it's re-sent to the device every ~1.5 s while
     waiting. The serial getty / emergency shell sometimes sits idle and emits
     nothing until poked, so a single up-front newline can be silently dropped;
-    re-nudging wakes it without depending on perfect timing."""
+    re-nudging wakes it without depending on perfect timing.
+
+    If `idle_reset` is set, the `timeout` measures *idle* time: the deadline is
+    pushed forward whenever the device emits bytes. This lets a caller wait
+    through a long-but-progressing boot (the console keeps spewing) while still
+    failing promptly on a genuinely dead line (no bytes for `timeout` s)."""
     buf = b""
     deadline = time.monotonic() + timeout
     next_nudge = time.monotonic() + 1.5
@@ -169,6 +177,8 @@ class Mdma:
       data = os.read(fd, 4096)
       if not data:
         continue
+      if idle_reset:
+        deadline = time.monotonic() + timeout
       buf += data.replace(b"\r\n", b"\n")
       m = pattern.search(self.ANSI_RE.sub(b"", buf))
       if m:
@@ -185,16 +195,64 @@ class Mdma:
   # How long to nudge for a prompt before declaring the console dead. An idle
   # serial getty / emergency shell can take several seconds to start echoing.
   ANY_PROMPT_TIMEOUT = 12.0
+  # When waiting for a booting device (--wait), how many seconds of serial
+  # silence count as "boot output has stopped" before we probe for a live shell.
+  QUIESCE_IDLE = 3.0
 
-  def _ensure_login(self, fd, timeout=20.0):
+  def _wait_for_boot(self, fd, wait):
+    """Wait up to `wait` s for a *booting* device to reach a usable shell.
+
+    A booting comma four can't be detected by a prompt regex alone: the UART
+    replays buffered serial input (including this tool's own prior command
+    frames and stale `root@none:~#` prompts) as it boots, so a naive prompt
+    match fires early — on residue, not a live shell — and the command we then
+    send gets shredded by ongoing boot spew. Instead we (1) wait for the console
+    to go *quiet* (boot output stopped — QUIESCE_IDLE s with no bytes), then
+    (2) prove the shell is actually live with a random-token echo handshake that
+    replayed residue can't fake. Loops until the handshake passes or `wait`
+    elapses; a dead line falls out when quiescence never produces a live shell."""
+    hard = time.monotonic() + wait
+    while time.monotonic() < hard:
+      # wait for boot output to settle: drain until QUIESCE_IDLE s of silence.
+      quiet_deadline = time.monotonic() + self.QUIESCE_IDLE
+      while time.monotonic() < quiet_deadline and time.monotonic() < hard:
+        if select.select([fd], [], [], 0.25)[0] and os.read(fd, 4096):
+          quiet_deadline = time.monotonic() + self.QUIESCE_IDLE  # reset on output
+      # console is quiet (or we're out of time) — is a live shell really there?
+      if self._handshake(fd, timeout=min(5.0, max(0.5, hard - time.monotonic()))):
+        return True
+      # not yet (still at login:, or boot not done) — nudge and loop.
+      os.write(fd, b"\n")
+    return False
+
+  def _handshake(self, fd, timeout=5.0):
+    """Prove a live, ready shell by echoing a fresh random token and requiring
+    it back. Distinguishes a real shell from replayed boot/serial residue and
+    from a `login:` prompt (which won't echo the token)."""
+    tok = self._nonce()
+    self._drain(fd)
+    os.write(fd, f"echo HS-{tok}\n".encode())
+    # the command line itself echoes "echo HS-<tok>"; the *result* line is a
+    # bare "HS-<tok>". Require the result (not preceded by "echo ").
+    want = re.compile(rb"(?<!echo )HS-" + tok.encode())
+    _, m = self._read_until(fd, want, timeout)
+    return m is not None
+
+  def _ensure_login(self, fd, timeout=20.0, wait=0.0):
     """Get the serial console to a live shell prompt, logging in with the
-    device's default comma/comma credentials if it's sitting at login:."""
+    device's default comma/comma credentials if it's sitting at login:.
+
+    `wait` (seconds) lets the caller wait for the device to *finish booting*
+    before running: see `_wait_for_boot`. With the default wait=0, behaviour is
+    the original fixed ~12 s nudge window (fail fast if no prompt)."""
+    any_prompt = re.compile(rb"login:\s*$|[Pp]assword:\s*$|[#\$]\s*$")
+    if wait > 0 and self._wait_for_boot(fd, wait):
+      return  # handshake already confirmed a live shell
     # Don't pre-drain: the prompt may already be sitting in the buffer, and an
     # idle getty/emergency shell can take several seconds (or a few nudges) to
     # echo. Nudge with newlines for up to ANY_PROMPT_TIMEOUT s rather than
     # firing one \n and giving up after 3 s — that 3 s window was the dominant
     # "no response from serial console" false negative.
-    any_prompt = re.compile(rb"login:\s*$|[Pp]assword:\s*$|[#\$]\s*$")
     buf, m = self._read_until(fd, any_prompt, self.ANY_PROMPT_TIMEOUT, nudge=b"\n")
     if m is None:
       raise SystemExit("no response from serial console (is the device booted?)")
@@ -220,7 +278,7 @@ class Mdma:
     if m is None:
       raise SystemExit("login failed (wrong credentials or no shell prompt)")
 
-  def exec(self, script, timeout=30.0, _tries=2):
+  def exec(self, script, timeout=30.0, wait=0.0, _tries=2):
     """Run a bash script on the device over the serial console and return its
     output + exit code. The script may be an arbitrary multi-line program
     (heredocs, embedded python3, quotes, etc.).
@@ -237,14 +295,21 @@ class Mdma:
     arrived whole; the script's own exit code rides back via ${PIPESTATUS[0]}.
 
     Transient serial failures (idle console, a dropped/garbled frame) are
-    retried once with a fresh login. Logs in with comma/comma if the console is
-    at a login prompt. Requires gzip + base64 on the device PATH (AGNOS has
-    both)."""
+    retried once with a fresh login. `wait` (seconds) waits for a booting device
+    to reach a shell prompt before running (0 = don't wait; fail fast if no
+    prompt). Logs in with comma/comma if the console is at a login prompt.
+    Requires gzip + base64 on the device PATH (AGNOS has both)."""
+    # When waiting for a boot, allow more retries: the console is often flaky in
+    # the first seconds after a shell appears, so a single resend isn't enough.
+    tries = max(_tries, 3) if wait > 0 else _tries
     last_err = None
-    for attempt in range(_tries):
+    for attempt in range(tries):
       fd = self.open_serial()
       try:
-        self._ensure_login(fd)
+        # First attempt waits out the boot; retries re-confirm a live shell with
+        # a short handshake (the just-booted console can be transiently flaky)
+        # rather than blindly resending into it.
+        self._ensure_login(fd, wait=wait if attempt == 0 else (8.0 if wait > 0 else 0.0))
         self._drain(fd)
         return self._exec_once(fd, script, timeout)
       except _Transient as e:
@@ -377,7 +442,7 @@ def bash_script(args):
     script = " ".join(args.argv)
   else:
     raise SystemExit("bash: provide a command inline, or pipe a script via '-'")
-  return Mdma().exec(script, timeout=args.timeout)
+  return Mdma().exec(script, timeout=args.timeout, wait=args.wait)
 
 
 if __name__ == "__main__":
@@ -397,6 +462,8 @@ if __name__ == "__main__":
     if cmd == "bash":
       sp.add_argument("argv", nargs="*", help="the bash command to run inline; or '-' to read the script from stdin")
       sp.add_argument("--timeout", type=float, default=30.0, help="seconds to wait for output (default 30)")
+      sp.add_argument("--wait", type=float, default=0.0, metavar="SECONDS",
+                      help="wait up to SECONDS for a booting device to reach a shell prompt before running (default 0 = fail fast)")
   if len(sys.argv) == 1:
     parser.print_help()
     raise SystemExit(0)
