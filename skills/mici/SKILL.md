@@ -55,7 +55,8 @@ prints `MDMA not found.`). Power the SOC, force QDL for flashing/un-bricking, op
 serial console, run commands over serial, profile boot:
 
 ```bash
-$SKILL_DIR/scripts/mdma.py reboot          # normal power-cycle
+$SKILL_DIR/scripts/mdma.py boot            # reboot AND wait until ready for bash
+$SKILL_DIR/scripts/mdma.py reboot          # normal power-cycle (returns immediately)
 $SKILL_DIR/scripts/mdma.py reboot-qdl      # force QDL (un-brick / pre-flash)
 $SKILL_DIR/scripts/mdma.py serial          # interactive MSM UART console
 $SKILL_DIR/scripts/mdma.py bash 'uname -a' # run a command over serial, no network

@@ -108,6 +108,15 @@ class Mdma:
 
     return boot_time
 
+  def boot(self):
+    """Power-cycle into a normal boot and block until the device is back at a
+    confirmed live shell, ready for `bash` commands. One resilient, parameterless
+    step for the flash→reboot→wait loop: reboot then wait_until_ready (quiesce +
+    login + liveness handshake), so the next `bash` call lands on a real shell
+    instead of racing the boot. Raises if the device doesn't come up in time."""
+    self.reboot(qdl=False)
+    self.wait_until_ready()
+
   def serial(self):
     os.execvp("screen", ["screen", SERIAL_DEV, "115200"])
 
@@ -224,6 +233,45 @@ class Mdma:
       # not yet (still at login:, or boot not done) — nudge and loop.
       os.write(fd, b"\n")
     return False
+
+  # Built-in budget for the parameterless `boot` waiter: how long to wait for a
+  # power-cycled device to come all the way up to a confirmed live shell. A
+  # comma four normally boots in ≈5–45 s (observed ~60 s including the login +
+  # handshake settle), so 90 s leaves headroom for a slow first boot after a
+  # flash while still failing promptly on a genuinely stuck boot. The command
+  # returns as soon as the shell is live — the budget only bounds a hung boot.
+  BOOT_READY_TIMEOUT = 90.0
+
+  def wait_until_ready(self, timeout=BOOT_READY_TIMEOUT, _retries=3):
+    """Block until the serial console is at a *confirmed live shell* — ready to
+    accept `bash` commands — logging in with comma/comma if it lands at a
+    `login:` prompt. Returns True once a fresh-token echo handshake proves the
+    shell is real (not replayed boot residue or a bare login: prompt); raises
+    SystemExit if `timeout` s elapse without one.
+
+    This is the readiness primitive behind the `boot` command, built from the
+    same `_ensure_login`/`_handshake` machinery `bash --wait` drives the console
+    with. A just-booted console is transiently flaky, so a failed handshake is
+    retried a few times (re-driving login) before giving up."""
+    deadline = time.monotonic() + timeout
+    last_err = "device never reached a live shell"
+    for _ in range(max(1, _retries)):
+      remaining = deadline - time.monotonic()
+      if remaining <= 0:
+        break
+      fd = self.open_serial()
+      try:
+        # _ensure_login drives the console through quiesce + (if needed) login
+        # to a shell prompt; the trailing handshake then *proves* it's live.
+        self._ensure_login(fd, wait=remaining)
+        if self._handshake(fd, timeout=min(8.0, max(1.0, deadline - time.monotonic()))):
+          return True
+        last_err = "reached a shell but it failed the liveness handshake"
+      except SystemExit as e:
+        last_err = str(e)
+      finally:
+        os.close(fd)
+    raise SystemExit(f"device not ready after {timeout:.0f}s ({last_err})")
 
   def _handshake(self, fd, timeout=5.0):
     """Prove a live, ready shell by echoing a fresh random token and requiring
@@ -447,7 +495,8 @@ def bash_script(args):
 
 if __name__ == "__main__":
   cmds = {
-    "reboot":       (lambda a: Mdma().reboot(qdl=False), "reboot comma four into normal boot"),
+    "reboot":       (lambda a: Mdma().reboot(qdl=False), "reboot comma four into normal boot (returns immediately)"),
+    "boot":         (lambda a: Mdma().boot(), "reboot and wait until the device is at a live shell, ready for bash"),
     "reboot-qdl":   (lambda a: Mdma().reboot(qdl=True), "reboot comma four into QDL mode for flashing"),
     "serial":       (lambda a: Mdma().serial(), "open the MSM UART console with screen"),
     "profile-boot": (lambda a: Mdma().profile_boot(), "reboot comma four and profile boot time"),
