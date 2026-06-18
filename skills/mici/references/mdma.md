@@ -31,14 +31,19 @@ Run from the skill's directory (or pass the full path to `scripts/mdma.py`):
 
 | Command | What it does |
 | --- | --- |
-| `reboot` | Power-cycle the SOC into a **normal** boot. |
+| `boot` | Power-cycle into a normal boot **and block until the device is back at a live shell**, ready for `bash`. One parameterless, resilient step — use this after a kernel flash instead of `reboot` + `bash --wait`. |
+| `reboot` | Power-cycle the SOC into a **normal** boot. Returns immediately — does **not** wait for the device to come up (use `boot` for that). |
 | `reboot-qdl` | Power-cycle the SOC into **QDL mode** for flashing — the un-brick path. |
 | `serial` | Open the MSM UART console with `screen` at 115200 baud. |
 | `bash <cmd...>` / `bash -` | Run a bash script on the device **over serial** and print its stdout/stderr; exits with the script's exit code. Pass a one-liner inline, or `-` to read a multi-line script from stdin (heredocs, embedded `python3`, etc. all work). Output is gzip-compressed on the device for speed and is byte-exact/binary-safe. Logs in with the default `comma`/`comma` credentials if the console is at a `login:` prompt. `--wait SECONDS` waits for a *booting* device to reach a usable shell before running (default 0 = fail fast); `--timeout SECONDS` bounds how long to wait for the command's output (default 30). |
 | `profile-boot` | Reboot into normal boot and stream the serial console with `[seconds.ms]` timestamps until the login/shell prompt appears. |
 
 ```bash
-# normal reboot
+# reboot AND wait until the device is back at a live shell (parameterless).
+# this is the resilient one-shot for the flash→reboot→wait loop:
+scripts/mdma.py boot
+
+# normal reboot, returns immediately (doesn't wait for the device to come up)
 scripts/mdma.py reboot
 
 # force QDL mode (e.g. before flashing)
@@ -71,8 +76,14 @@ EOF
 # bump the timeout for slow scripts (default 30s):
 scripts/mdma.py bash --timeout 120 'sleep 60; echo woke up'
 
-# wait for a booting device to come up, then run (e.g. right after a reboot):
-scripts/mdma.py reboot
+# after a kernel flash: reboot and wait until the device is ready, then run.
+# `boot` blocks until a live shell is confirmed, so the next `bash` won't race
+# the boot — this is the reliable replacement for `reboot` + `bash --wait`:
+scripts/mdma.py boot
+scripts/mdma.py bash 'uname -r; cut -d" " -f1 /proc/uptime'
+
+# `bash --wait SECONDS` is still available when you want the wait folded into a
+# single command (e.g. you didn't reboot via `boot`):
 scripts/mdma.py bash --wait 120 'uname -r; cut -d" " -f1 /proc/uptime'
 
 # reboot and print a timestamped boot trace, returns at the prompt
@@ -104,6 +115,7 @@ With no subcommand, the script prints help and exits 0.
   - **Exit code:** the script's bash exit is captured **inside** the command substitution (`echo $? > /tmp/.mdma_rc_<nonce>`); reading `${PIPESTATUS[0]}` *after* `out=$(…)` would reflect the assignment's own pipeline (always 0), not the script's. `rc` rides back in the end marker and becomes the `bash` subcommand's process exit code. The tiny rc temp file is removed each call.
   - **Reliability:** prompt detection nudges the console with newlines for up to ~12 s (an idle serial getty / emergency shell can sit silent until poked and may take several seconds to echo), instead of firing one newline and giving up after 3 s — that short window was the dominant **"no response from serial console"** false negative. A transient round-trip failure (garbled/truncated frame, length mismatch, decode error) is **retried once** with a fresh login; a genuinely dead console fails cleanly after the prompt window with "no response from serial console". *Note:* during early kernel bring-up the device-side console may stop servicing the UART entirely — that's a device state no host retry can fix; reboot to recover.
   - **`--wait` (boot-wait):** a *booting* device can't be detected by a prompt regex alone — the UART **replays buffered serial input** as it boots (including this tool's own prior command frames and stale `root@none:~#` prompts), so a naive prompt match fires on residue, not a live shell, and the command then gets shredded by ongoing boot spew. `--wait SECONDS` instead waits for the console to go **quiet** (boot output stopped for `QUIESCE_IDLE` s), then proves a live shell with a **random-token `echo` handshake** that replayed residue can't fake; it loops until the handshake passes or the deadline. This is what makes `reboot` immediately followed by `bash --wait` reliable across the device's variable (≈5–45 s) boot time.
+- **`boot`** is `reboot` (VIN-first normal power-cycle) immediately followed by `wait_until_ready()`, packaged as one parameterless command so the flash→reboot→wait loop needs no tuning. `wait_until_ready` is the same readiness primitive `bash --wait` uses — it drives the console through quiesce → login (comma/comma if it lands at `login:`) → a confirming **liveness handshake**, and only returns once a fresh-token `echo` round-trips (proving a real shell, not replayed boot residue or a bare `login:`). A just-booted console is transiently flaky, so a failed handshake re-drives login a few times before giving up. The built-in budget is `BOOT_READY_TIMEOUT` (90 s — headroom over the observed ~60 s boot+login+handshake for a slow first boot after a flash); `boot` returns as soon as the shell is live and only raises `device not ready after …s` on a genuinely stuck boot. Because it confirms a live shell (not just any prompt), the **emergency shell** counts as ready too — both paths land on a usable shell.
   - This runs over the **serial console**, not SSH — works with no network, but the device must be booted to a login/shell prompt (not QDL or mid-boot) and needs `gzip`/`base64`/`bash` on PATH (AGNOS has all three).
   - **Emergency / maintenance shell:** if the device drops to the systemd emergency shell (e.g. a failed `nofail`-less mount during development), the console lands directly on a `root@…#` shell with **no `login:` prompt**. That shell turns on **bracketed-paste mode**, wrapping its prompt and every echoed line in `\x1b[?2004h`/`\x1b[?2004l` escape sequences. `bash` is resilient to this: prompt detection matches against an ANSI-stripped view of the serial buffer (`ANSI_RE`), and `_extract` strips those escapes before base64-decoding so their base64-legal interior bytes (`2004`, `h`, `l`) can't corrupt the output blob. So `bash` works at the emergency shell exactly as it does at a normal login.
 
@@ -115,7 +127,7 @@ QDL flashing is the un-brickable recovery/flash path. The general sequence (driv
 
 1. `scripts/mdma.py reboot-qdl` — drop the SOC into QDL.
 2. Run the QDL flasher (e.g. `qdl` / the agnos-builder flash script) to write images.
-3. `scripts/mdma.py reboot` — boot the freshly flashed system.
+3. `scripts/mdma.py boot` — boot the freshly flashed system **and wait until it's back at a live shell**, so the next step (verify the kernel, run anything) lands on a ready device. (Use bare `reboot` only if you don't need to wait — e.g. you just want to power it back on and walk away.)
 
 ### Required hardware setup for QDL — the aux cable
 
@@ -141,9 +153,16 @@ Diagnosing a missing/wrong aux connection (control-transfer probes against the h
 ```bash
 scripts/mdma.py reboot-qdl                 # into QDL (verify: lsusb -d 3801:9008 on Bus 2)
 ( cd /path/to/vamOS && ./vamos flash kernel )   # flash boot_a
-scripts/mdma.py reboot                      # VIN-first; boots through the momentary
-                                            # QDL flicker into the flashed kernel
+scripts/mdma.py boot                        # VIN-first; boots through the momentary
+                                            # QDL flicker into the flashed kernel AND
+                                            # blocks until it's back at a live shell
+scripts/mdma.py bash 'uname -r'             # device is ready — verify the flashed kernel
 ```
+
+`boot` is the reliability win for this loop: a bare `reboot` returns the instant
+it toggles VIN, so any command you run next races the ≈5–45 s (sometimes longer
+after a flash) boot and gets shredded by boot spew. `boot` waits out the boot and
+**confirms a live shell** before returning, so the verify step never races.
 
 Gotchas observed:
 - **`reboot-qdl` doesn't always cut VIN.** It returns exit 0 but sometimes no-ops the power cut — the device never power-cycles and just stays on its current boot. Confirm the cut by checking that **uptime reset** (`scripts/mdma.py bash 'cut -d" " -f1 /proc/uptime'` should drop to single digits). If uptime kept climbing, re-issue. A re-enumeration of the MDMA hubs (fresh `lsusb` device numbers) tends to restore a working power toggle.
@@ -152,6 +171,6 @@ Gotchas observed:
 
 ## Maintaining this reference
 
-`scripts/mdma.py` started as a **copy** of `agnos-builder/scripts/mdma.py`, but this copy has since diverged: the `bash` command (serial-console command execution with auto-login) is **skill-only** and does not exist upstream. When re-syncing after upstream changes, don't blindly overwrite — merge upstream changes in and keep the `bash` machinery: the `_Transient` exception; the `Mdma` methods `open_serial`, `_drain`, `_read_until` (with its `nudge=` arg), `_ensure_login` (and `ANY_PROMPT_TIMEOUT`), `exec`, `_exec_once`, `_nonce`, `_extract`; the module-level `bash_script` arg resolver; the `zlib`/`base64` imports; and the `bash` subparser wiring.
+`scripts/mdma.py` started as a **copy** of `agnos-builder/scripts/mdma.py`, but this copy has since diverged: the `bash` and `boot` commands (serial-console command execution with auto-login; reboot-and-wait-until-ready) are **skill-only** and do not exist upstream. When re-syncing after upstream changes, don't blindly overwrite — merge upstream changes in and keep the skill-only machinery: the `_Transient` exception; the `Mdma` methods `open_serial`, `_drain`, `_read_until` (with its `nudge=` arg), `_wait_for_boot`, `_handshake`, `wait_until_ready` (and `BOOT_READY_TIMEOUT`), `boot`, `_ensure_login` (and `ANY_PROMPT_TIMEOUT`/`QUIESCE_IDLE`), `exec`, `_exec_once`, `_nonce`, `_extract`; the module-level `bash_script` arg resolver; the `zlib`/`base64` imports; and the `boot` + `bash` subparser wiring.
 
 Then re-read this reference against the new command table / behavior and update as needed.
