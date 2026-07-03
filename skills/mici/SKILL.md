@@ -18,14 +18,13 @@ allowed-tools: Bash(*), Read
 
 # mici — comma four toolkit
 
-Tools for the **comma four** (aka mici). Two areas, each with its own reference and
-script. Read the reference for the area you need before using its commands.
+Two areas, each with its own reference and script. Read the reference for the area
+you need before using its commands.
 
 ## UI — screenshot + touch  →  `references/ui.md`
 
-See and drive the touchscreen for testing UI changes. One host CLI,
-`scripts/mici`, hides all device plumbing (deploy, transport, venv, pulling
-screenshots back):
+See and drive the touchscreen to test UI changes. One host CLI, `scripts/mici`, hides
+all device plumbing (deploy, transport, venv, pulling screenshots back):
 
 ```bash
 $SKILL_DIR/scripts/mici --transport mdma capture [OUT.png]    # wired adapter, no network
@@ -36,44 +35,48 @@ $SKILL_DIR/scripts/mici --host comma@HOST hold LX LY
 $SKILL_DIR/scripts/mici --host comma@HOST run 'tap 268 120; wait .6; capture'   # chain in one call
 ```
 
-Two first-class transports, chosen with `--transport ssh|mdma|auto` (or `MICI_TRANSPORT`):
-- **mdma** — the wired adapter, no network. Needs no host.
-- **ssh** — pass `--host USER@HOST` (or set `MICI_HOST`); ask the user for it if unknown.
-- **auto** (default) — prefers MDMA if the adapter is wired, else SSH.
+Transport via `--transport ssh|mdma|auto` (or `MICI_TRANSPORT`): **mdma** = wired
+adapter, no host; **ssh** = pass `--host USER@HOST` (or `MICI_HOST`), ask the user if
+unknown; **auto** (default) prefers MDMA if wired, else SSH.
 
-Coordinates are upright-landscape (the frame you see in a capture). Prefer `mici run`
-for multi-step flows — it runs the whole chain in one device invocation. **See
+Coordinates are the upright-landscape frame you see in a capture. Prefer `mici run`
+for multi-step flows (one device invocation for the whole chain). **See
 `references/ui.md`** for coordinates, the chain step language, openpilot UI navigation
-behavior (home-is-one-big-button, the ~30 s interactive timeout, swipe scroller
-routing), and internals.
+(home-is-one-big-button, ~30 s interactive timeout, swipe scroller routing), and internals.
 
 ## MDMA — hardware debug board  →  `references/mdma.md`
 
-Low-level access via the wired **mici debug and monitoring adapter**. Only applies
-when a comma four is **physically wired to an MDMA adapter** (else `scripts/mdma.py`
-prints `MDMA not found.`). Power the SOC, force QDL for flashing/un-bricking, open the
-serial console, run commands over serial, profile boot:
+Low-level access via the wired **mici debug and monitoring adapter**. Only applies when
+a comma four is **physically wired to an MDMA adapter** (else `scripts/mdma.py` prints
+`MDMA not found.`).
 
 ```bash
-$SKILL_DIR/scripts/mdma.py boot            # reboot AND wait until ready for bash
-$SKILL_DIR/scripts/mdma.py reboot          # normal power-cycle (returns immediately)
-$SKILL_DIR/scripts/mdma.py reboot-qdl      # force QDL (un-brick / pre-flash)
+$SKILL_DIR/scripts/mdma.py flash --verify 'uname -r' -- <kernel-flash-command>
+                                           # whole iteration in one shot:
+                                           # QDL → flash → boot → verify, with timings
+$SKILL_DIR/scripts/mdma.py boot            # verified power-cycle; waits until ready for
+                                           # bash; captures full boot console to /tmp/mdma/ log
+$SKILL_DIR/scripts/mdma.py qdl             # force QDL (un-brick / pre-flash)
+$SKILL_DIR/scripts/mdma.py reboot          # raw power-cycle (returns immediately)
+$SKILL_DIR/scripts/mdma.py off             # cut SOC power
 $SKILL_DIR/scripts/mdma.py serial          # interactive MSM UART console
 $SKILL_DIR/scripts/mdma.py bash 'uname -a' # run a command over serial, no network
 $SKILL_DIR/scripts/mdma.py profile-boot    # timestamped boot trace
 ```
 
-**QDL prerequisite:** forcing QDL needs an **aux USB-C cable looped from the dev
-board's aux port → the comma four's USB-C port** (the SOC then enumerates as
-`3801:9008` on Bus 2). Without it QDL never appears. See the flashing-flow section
-of `references/mdma.md` for the full setup + the hands-free flash loop.
+**QDL prerequisites & gotchas:** forcing QDL needs an **aux USB-C cable looped from the
+dev board's aux port → the comma four's USB-C port**. Just run `qdl` (alias
+`reboot-qdl`) — the aux-first power cycle is the mechanism and it's reliable. Do **not**
+use `lsusb -d 3801:9008` as a QDL indicator: that device is always present on the MDMA
+dev board even when the comma four is booted normally (a board artifact), so it proves
+nothing.
 
-**See `references/mdma.md`** for the full command table, `bash -` multi-line/stdin
-usage, `--missing-ok`, the flashing flow (incl. **required aux-cable setup** and the
-hands-free QDL→flash→reboot loop), and how it works (VIN/QDL GPIO, serial protocol).
+**See `references/mdma.md`** for the full command table, `bash -` multi-line/stdin usage,
+`--missing-ok`, the flashing flow (incl. **required aux-cable setup** and the hands-free
+QDL→flash→reboot loop), and how it works (VIN/QDL GPIO, serial protocol).
 
-> The `scripts/mdma.py bash` command is also the no-network transport the UI CLI
-> falls back to — so the two areas share the same serial link to the device.
+> `scripts/mdma.py bash` is also the no-network transport the UI CLI falls back to — the
+> two areas share the same serial link to the device.
 
 ## Scripts
 
