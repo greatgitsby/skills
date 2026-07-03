@@ -9,6 +9,7 @@ import fcntl
 import os
 import re
 import select
+import subprocess
 import sys
 import termios
 import time
@@ -17,11 +18,25 @@ import zlib
 import usb.core
 
 SERIAL_DEV = "/dev/serial/by-id/usb-Microchip_Tech_USB2_Controller_Hub-if01"
-PROMPT_RE = re.compile(rb"(?:login:|[#\$])$")
+# boot is done when the serial getty prints its login prompt. Matching bare
+# `#`/`$` line endings ends profiling early on boot spew (kernel logs, shell
+# residue), so require the full `comma-<hostname> login:` getty prompt.
+PROMPT_RE = re.compile(rb"comma-\S+ login:")
 USB_RT_PORT = 0x23
 USB_REQ_CLEAR_FEATURE = 1
 USB_REQ_SET_FEATURE = 3
 USB_PORT_POWER = 8
+
+
+_T0 = time.monotonic()
+
+
+def _log(msg):
+  """Timestamped progress to stderr — the diagnostic surface for agents driving
+  this tool. Every state transition, retry, and fallback is narrated so a
+  failure localizes from the log alone. stdout stays reserved for device
+  output (`bash`)."""
+  print(f"[mdma +{time.monotonic() - _T0:5.1f}s] {msg}", file=sys.stderr, flush=True)
 
 
 class _Transient(Exception):
@@ -43,15 +58,47 @@ class Pins:
 
 
 class Mdma:
-  """
-    MDMA: the mici debug and monitoring adapter
+  """MDMA: the mici debug and monitoring adapter — low-level mici (comma four)
+  dev. Power the SOC on/off, force QDL mode for un-brickability, read/write the
+  SOC's UART, and more."""
 
-    an MDMA is your best friend for low level mici (aka comma four) development.
-    - power the SOC on and off
-    - force the SOC into QDL mode for un-brickability
-    - read and write to the SOC's UART
-    - and more!
-  """
+  # Boot-console capture: while set (see _cap_open), every byte read from the
+  # serial fd through self._read is also written to this file as timestamped
+  # `[   N.NNN] line` lines (profile-boot style), so the full boot log can be
+  # read after the fact instead of re-running with a console attached.
+  BOOT_LOG_DIR = "/tmp/mdma"
+  _cap = None
+
+  def _cap_open(self, tag):
+    os.makedirs(self.BOOT_LOG_DIR, exist_ok=True)
+    path = os.path.join(self.BOOT_LOG_DIR, time.strftime(f"{tag}-%Y%m%d-%H%M%S.log"))
+    self._cap = open(path, "wb")
+    self._cap_t0 = time.monotonic()
+    self._cap_pending = b""
+    return path
+
+  def _cap_write(self, data):
+    self._cap_pending += data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    while b"\n" in self._cap_pending:
+      line, self._cap_pending = self._cap_pending.split(b"\n", 1)
+      self._cap.write(f"[{time.monotonic() - self._cap_t0:8.3f}] ".encode() + line + b"\n")
+    self._cap.flush()
+
+  def _cap_close(self):
+    if self._cap:
+      if self._cap_pending:
+        self._cap_write(b"\n")  # flush a trailing partial line
+      self._cap.close()
+      self._cap = None
+
+  def _read(self, fd, n=4096):
+    """os.read that tees into the boot-console capture file when one is open.
+    All console readers go through here so a capture opened in boot() sees the
+    complete boot output regardless of which path consumed it."""
+    data = os.read(fd, n)
+    if data and self._cap:
+      self._cap_write(data)
+    return data
 
   def hub(self, vid, pid):
     hub = usb.core.find(idVendor=vid, idProduct=pid)
@@ -108,14 +155,82 @@ class Mdma:
 
     return boot_time
 
+  # A real power cycle spews boot output on the UART within a few seconds of
+  # VIN coming up. If the serial line stays silent this long after a cycle, the
+  # VIN cut no-op'd (a known MDMA flake) and the cycle must be re-issued.
+  CYCLE_SPEW_TIMEOUT = 8.0
+  # Fast-path boot watch: how many seconds of serial *idle* (no bytes at all)
+  # mean the getty prompt isn't coming and we should fall back to the quiesce
+  # waiter. Boot spew gaps are seconds, so 30 s idle is decisively dead.
+  BOOT_SPEW_IDLE = 30.0
+
   def boot(self):
-    """Power-cycle into a normal boot and block until the device is back at a
-    confirmed live shell, ready for `bash` commands. One resilient, parameterless
-    step for the flash→reboot→wait loop: reboot then wait_until_ready (quiesce +
-    login + liveness handshake), so the next `bash` call lands on a real shell
-    instead of racing the boot. Raises if the device doesn't come up in time."""
-    self.reboot(qdl=False)
-    self.wait_until_ready()
+    """Power-cycle into a normal boot and block until the device is at a
+    confirmed live shell, ready for `bash`. One resilient, parameterless step
+    for the flash→reboot→wait loop.
+
+    - **Verified power cut**: a real cycle spews boot output within seconds; a
+      silent line means the VIN cut no-op'd (known MDMA flake), so the cycle is
+      re-issued instead of waiting 90 s on a device that never rebooted.
+    - **Event-driven ready**: watch the boot spew for the getty `comma-* login:`
+      prompt and log in the *moment* it appears — no fixed quiesce windows on
+      the happy path. The login + random-token handshake still prove the shell
+      is live (replayed residue can't fake it).
+    - Off the happy path (emergency shell, garbled login, residue match) falls
+      back to the quiesce waiter wait_until_ready.
+    Full boot console is captured to a timestamped log under BOOT_LOG_DIR (path
+    on stderr) for post-hoc reading. Raises if the device doesn't come up."""
+    log_path = self._cap_open("boot")
+    _log(f"capturing full boot console to {log_path}")
+    try:
+      return self._boot()
+    finally:
+      self._cap_close()
+
+  def _boot(self):
+    for attempt in range(3):
+      fd = self.open_serial()
+      try:
+        self._drain(fd)
+        self.reboot(qdl=False)
+        _log(f"power cycle issued (VIN-first, normal boot; attempt {attempt + 1}/3)")
+        # verify the cut took: real boots print UART spew almost immediately
+        if not select.select([fd], [], [], self.CYCLE_SPEW_TIMEOUT)[0]:
+          _log(f"no boot output within {self.CYCLE_SPEW_TIMEOUT:.0f}s — VIN cut likely no-op'd (known MDMA flake); re-cycling")
+          continue
+        _log("boot output detected — power cut confirmed, watching for getty login prompt")
+        # fast path: log in the instant the getty prompt appears
+        _, m = self._read_until(fd, PROMPT_RE, self.BOOT_SPEW_IDLE, idle_reset=True)
+        if m is not None:
+          _log("getty login prompt seen — logging in (comma/comma)")
+          try:
+            self._login(fd, timeout=15.0)
+            if self._handshake(fd, timeout=8.0):
+              _log("liveness handshake ok — device ready for bash")
+              return True
+            _log("logged in but liveness handshake failed (residue prompt?) — falling back to quiesce waiter")
+          except SystemExit as e:
+            _log(f"fast-path login failed ({e}) — falling back to quiesce waiter")
+        else:
+          _log(f"no getty prompt within {self.BOOT_SPEW_IDLE:.0f}s of serial idle (emergency shell or unusual boot?) — falling back to quiesce waiter")
+      finally:
+        os.close(fd)
+      # off the happy path (no getty prompt / failed handshake — e.g. the
+      # emergency shell, which never prints login:) — quiesce waiter takes over.
+      ok = self.wait_until_ready()
+      _log("quiesce waiter confirmed a live shell — device ready for bash")
+      return ok
+    raise SystemExit("power cycle had no effect after 3 attempts (no boot output on serial) — check MDMA hubs (re-plug / re-enumerate often restores the power toggle)")
+
+  def qdl(self):
+    """Force the SOC into QDL mode via the aux-first power cycle. This is the
+    reliable path — just run it. NOTE: `lsusb -d 3801:9008` is NOT a QDL
+    indicator: on the MDMA dev board that device is always present with a
+    healthy device (a board artifact), so enumeration can't verify (or refute)
+    QDL entry. Needs the aux USB-C cable looped from the dev board's aux port
+    to the comma four's USB-C port."""
+    self.reboot(qdl=True)
+    _log("aux-first power cycle issued — SOC forced into QDL (no enumeration check possible: 3801:9008 is always present on the dev board)")
 
   def serial(self):
     os.execvp("screen", ["screen", SERIAL_DEV, "115200"])
@@ -147,7 +262,7 @@ class Mdma:
     # select-gated so it never blocks if the device happens to be mid-output
     # (the fd is in blocking mode, so a bare os.read could stall).
     while select.select([fd], [], [], 0.05)[0]:
-      if not os.read(fd, 4096):
+      if not self._read(fd):
         break
 
   # ANSI CSI / bracketed-paste escapes (e.g. \x1b[?2004h around a prompt). The
@@ -183,7 +298,7 @@ class Mdma:
         next_nudge = time.monotonic() + 1.5
       if not select.select([fd], [], [], 0.25)[0]:
         continue
-      data = os.read(fd, 4096)
+      data = self._read(fd)
       if not data:
         continue
       if idle_reset:
@@ -212,34 +327,43 @@ class Mdma:
     """Wait up to `wait` s for a *booting* device to reach a usable shell.
 
     A booting comma four can't be detected by a prompt regex alone: the UART
-    replays buffered serial input (including this tool's own prior command
-    frames and stale `root@none:~#` prompts) as it boots, so a naive prompt
-    match fires early — on residue, not a live shell — and the command we then
-    send gets shredded by ongoing boot spew. Instead we (1) wait for the console
-    to go *quiet* (boot output stopped — QUIESCE_IDLE s with no bytes), then
-    (2) prove the shell is actually live with a random-token echo handshake that
-    replayed residue can't fake. Loops until the handshake passes or `wait`
-    elapses; a dead line falls out when quiescence never produces a live shell."""
+    replays buffered serial input (this tool's own prior command frames, stale
+    `root@none:~#` prompts) as it boots, so a naive match fires on residue, not a
+    live shell, and the command we send gets shredded by boot spew. Instead:
+    (1) wait for the console to go *quiet* (QUIESCE_IDLE s with no bytes), then
+    (2) drive to a shell — a power-cycled device lands at a getty `login:`, so we
+    must actually log in (a bare handshake can't pass at login:, and its
+    `echo HS-...` probe gets typed as a username, wedging getty in
+    Password:/Login-incorrect cycles) — then (3) prove the shell live with a
+    random-token echo handshake replayed residue can't fake. Loops until the
+    handshake passes or `wait` elapses."""
     hard = time.monotonic() + wait
     while time.monotonic() < hard:
       # wait for boot output to settle: drain until QUIESCE_IDLE s of silence.
       quiet_deadline = time.monotonic() + self.QUIESCE_IDLE
       while time.monotonic() < quiet_deadline and time.monotonic() < hard:
-        if select.select([fd], [], [], 0.25)[0] and os.read(fd, 4096):
+        if select.select([fd], [], [], 0.25)[0] and self._read(fd):
           quiet_deadline = time.monotonic() + self.QUIESCE_IDLE  # reset on output
-      # console is quiet (or we're out of time) — is a live shell really there?
+      # console is quiet (or we're out of time) — get to a shell (logging in at
+      # a login: prompt if that's where we are), then prove it's really live.
+      try:
+        self._login(fd, timeout=min(20.0, max(1.0, hard - time.monotonic())))
+      except SystemExit:
+        # no usable prompt yet (boot not done, or a garbled login attempt) —
+        # nudge and loop back through quiescence.
+        os.write(fd, b"\n")
+        continue
       if self._handshake(fd, timeout=min(5.0, max(0.5, hard - time.monotonic()))):
         return True
-      # not yet (still at login:, or boot not done) — nudge and loop.
+      # prompt was residue, not a live shell — nudge and loop.
       os.write(fd, b"\n")
     return False
 
-  # Built-in budget for the parameterless `boot` waiter: how long to wait for a
-  # power-cycled device to come all the way up to a confirmed live shell. A
-  # comma four normally boots in ≈5–45 s (observed ~60 s including the login +
-  # handshake settle), so 90 s leaves headroom for a slow first boot after a
-  # flash while still failing promptly on a genuinely stuck boot. The command
-  # returns as soon as the shell is live — the budget only bounds a hung boot.
+  # Budget for the `boot` waiter to reach a confirmed live shell. A comma four
+  # boots in ≈5–45 s (observed ~60 s incl. login + handshake settle), so 90 s
+  # leaves headroom for a slow first boot after a flash while still failing
+  # promptly on a stuck boot. Returns as soon as the shell is live; the budget
+  # only bounds a hung boot.
   BOOT_READY_TIMEOUT = 90.0
 
   def wait_until_ready(self, timeout=BOOT_READY_TIMEOUT, _retries=3):
@@ -249,10 +373,10 @@ class Mdma:
     shell is real (not replayed boot residue or a bare login: prompt); raises
     SystemExit if `timeout` s elapse without one.
 
-    This is the readiness primitive behind the `boot` command, built from the
-    same `_ensure_login`/`_handshake` machinery `bash --wait` drives the console
-    with. A just-booted console is transiently flaky, so a failed handshake is
-    retried a few times (re-driving login) before giving up."""
+    The readiness primitive behind `boot`, built from the same
+    `_ensure_login`/`_handshake` machinery `bash --wait` uses. A just-booted
+    console is transiently flaky, so a failed handshake is retried a few times
+    (re-driving login) before giving up."""
     deadline = time.monotonic() + timeout
     last_err = "device never reached a live shell"
     for _ in range(max(1, _retries)):
@@ -269,6 +393,7 @@ class Mdma:
         last_err = "reached a shell but it failed the liveness handshake"
       except SystemExit as e:
         last_err = str(e)
+        _log(f"readiness attempt failed ({last_err}) — retrying")
       finally:
         os.close(fd)
     raise SystemExit(f"device not ready after {timeout:.0f}s ({last_err})")
@@ -293,9 +418,16 @@ class Mdma:
     `wait` (seconds) lets the caller wait for the device to *finish booting*
     before running: see `_wait_for_boot`. With the default wait=0, behaviour is
     the original fixed ~12 s nudge window (fail fast if no prompt)."""
+    if wait > 0:
+      if self._wait_for_boot(fd, wait):
+        return  # handshake already confirmed a live shell
+      raise SystemExit(f"device did not reach a live shell within {wait:.0f}s of boot")
+    self._login(fd, timeout)
+
+  def _login(self, fd, timeout=20.0):
+    """Drive the console from whatever prompt it's at (login:, Password:, or an
+    existing shell) to a shell prompt, logging in with comma/comma as needed."""
     any_prompt = re.compile(rb"login:\s*$|[Pp]assword:\s*$|[#\$]\s*$")
-    if wait > 0 and self._wait_for_boot(fd, wait):
-      return  # handshake already confirmed a live shell
     # Don't pre-drain: the prompt may already be sitting in the buffer, and an
     # idle getty/emergency shell can take several seconds (or a few nudges) to
     # echo. Nudge with newlines for up to ANY_PROMPT_TIMEOUT s rather than
@@ -328,25 +460,22 @@ class Mdma:
 
   def exec(self, script, timeout=30.0, wait=0.0, _tries=2):
     """Run a bash script on the device over the serial console and return its
-    output + exit code. The script may be an arbitrary multi-line program
-    (heredocs, embedded python3, quotes, etc.).
+    output + exit code. The script may be arbitrary multi-line (heredocs,
+    embedded python3, quotes, etc.).
 
-    Wire protocol: the script is base64-encoded on the host so only a single line
-    ever crosses the line-oriented serial console (no quoting/heredoc hazards).
-    On the device it's decoded and run under bash, and its combined stdout+stderr
-    is piped through `gzip | base64` before crossing back — gzip typically shrinks
-    text/log output 5-10x, and 115200 baud (~7.5 KB/s effective) is the real
-    bottleneck, so compressing on the device is ~3x faster on large output. The
-    host decodes + gunzips, so the captured bytes are exact (no whitespace
-    munging). The device frames the blob with a per-call nonce marker and emits
-    the blob's exact byte count, so the host slices it precisely and verifies it
-    arrived whole; the script's own exit code rides back via ${PIPESTATUS[0]}.
+    Wire protocol: the script is base64'd on the host so only a single line
+    crosses the line-oriented console (no quoting/heredoc hazards). On the device
+    it's decoded, run under bash, and its stdout+stderr piped through
+    `gzip | base64` before crossing back — 115200 baud (~7.5 KB/s effective) is
+    the bottleneck, so device-side compression is ~3x faster on large output. The
+    device frames the blob with a per-call nonce marker + exact byte count; the
+    host slices, verifies the length, gunzips (bytes are exact). Exit code rides
+    back in the end marker. See _exec_once / _extract for details.
 
-    Transient serial failures (idle console, a dropped/garbled frame) are
-    retried once with a fresh login. `wait` (seconds) waits for a booting device
-    to reach a shell prompt before running (0 = don't wait; fail fast if no
-    prompt). Logs in with comma/comma if the console is at a login prompt.
-    Requires gzip + base64 on the device PATH (AGNOS has both)."""
+    Transient serial failures (idle console, dropped/garbled frame) are retried
+    once with a fresh login. `wait` (seconds) waits for a booting device to reach
+    a shell before running (0 = fail fast). Logs in comma/comma at a login
+    prompt. Needs gzip + base64 on the device PATH (AGNOS has both)."""
     # When waiting for a boot, allow more retries: the console is often flaky in
     # the first seconds after a shell appears, so a single resend isn't enough.
     tries = max(_tries, 3) if wait > 0 else _tries
@@ -362,17 +491,18 @@ class Mdma:
         return self._exec_once(fd, script, timeout)
       except _Transient as e:
         last_err = e
+        if attempt + 1 < tries:
+          _log(f"serial round-trip failed ({e}) — retrying with a fresh login ({attempt + 2}/{tries})")
       finally:
         os.close(fd)
     raise SystemExit(str(last_err))
 
-  # A per-call nonce makes the framing immune to the command line the device
-  # echoes back: the host sends the marker as two shell args joined at runtime
-  # (`printf %s%s MDMA_<tag>_ <nonce>`), so the *concatenated* token only ever
-  # appears in real output, never in the echoed command. The old fixed
-  # `__MDMA_BEG_837__` literal appeared verbatim in the echo, and a drained/
-  # clipped echo would make rfind() land inside it and pull the base64 of the
-  # input script into the blob — the dominant base64-corruption failure.
+  # A per-call nonce makes the framing immune to the echoed command line: the
+  # host sends the marker as printf format + arg (`printf 'MDMABEG%s' <nonce>`),
+  # so the *concatenated* token only appears in real output, never in the echo.
+  # The old fixed `__MDMA_BEG_837__` literal appeared verbatim in the echo, and a
+  # drained/clipped echo would make rfind() land inside it and pull the input
+  # script's base64 into the blob — the dominant base64-corruption failure.
   def _exec_once(self, fd, script, timeout):
     nonce = self._nonce()
     beg = f"MDMABEG{nonce}".encode()
@@ -453,11 +583,16 @@ class Mdma:
     self.power_off()
 
     fd = self.open_serial()
-    while (data := os.read(fd, 4096)):
-      time.sleep(0.1)
+    self._drain(fd)
 
     # boot!
     start = self.reboot(qdl=False)
+
+    # discard the adapter's replay of stale console bytes right after power-on
+    while time.monotonic() - start < 0.5:
+      if not select.select([fd], [], [], 0.15)[0]:
+        break
+      os.read(fd, 4096)
 
     # show serial console with timestamps until boot is done
     pending = b""
@@ -480,6 +615,47 @@ class Mdma:
         return
 
 
+def flash_flow(args):
+  """Whole kernel-iteration loop in one command: QDL -> run the host flash
+  command -> boot to a confirmed live shell -> optionally run a verify command
+  on the device. Prints per-stage timings."""
+  if args.argv and args.argv[0] == "--":
+    args.argv = args.argv[1:]
+  if not args.argv:
+    raise SystemExit("flash: provide the host flash command, e.g.: mdma.py flash --verify 'uname -r' -- <kernel-flash-command>")
+  m = Mdma()
+  stages = []
+
+  def stage(name, fn):
+    _log(f"stage {name}: starting")
+    t0 = time.monotonic()
+    fn()
+    stages.append((name, time.monotonic() - t0))
+    _log(f"stage {name}: done in {stages[-1][1]:.1f}s")
+
+  stage("qdl", m.qdl)
+  def run_flasher():
+    # single arg -> shell string; multiple args -> exec list
+    cmd = args.argv[0] if len(args.argv) == 1 else args.argv
+    _log(f"running host flash command: {cmd if isinstance(cmd, str) else ' '.join(cmd)}")
+    rc = subprocess.call(cmd, shell=len(args.argv) == 1)
+    if rc != 0:
+      raise SystemExit(f"flash command failed (exit {rc}) — device is still in QDL; fix and rerun, or `mdma.py boot` to boot it back out")
+  stage("flash", run_flasher)
+  stage("boot", m.boot)
+  rc = 0
+  if args.verify:
+    def run_verify():
+      nonlocal rc
+      rc = m.exec(args.verify, timeout=args.timeout)
+      if rc != 0:
+        _log(f"verify command exited {rc}")
+    stage("verify", run_verify)
+  total = sum(t for _, t in stages)
+  print("── flash loop " + " ".join(f"{n}={t:.1f}s" for n, t in stages) + f" total={total:.1f}s", file=sys.stderr)
+  return rc
+
+
 def bash_script(args):
   # script body comes from stdin ("-") or inline argv (joined as one line).
   # both are base64-encoded and run under bash on the device, so multi-line
@@ -495,33 +671,47 @@ def bash_script(args):
 
 if __name__ == "__main__":
   cmds = {
-    "reboot":       (lambda a: Mdma().reboot(qdl=False), "reboot comma four into normal boot (returns immediately)"),
-    "boot":         (lambda a: Mdma().boot(), "reboot and wait until the device is at a live shell, ready for bash"),
-    "reboot-qdl":   (lambda a: Mdma().reboot(qdl=True), "reboot comma four into QDL mode for flashing"),
+    "boot":         (lambda a: Mdma().boot(), "power-cycle (verified) and wait until the device is at a live shell, ready for bash"),
+    "qdl":          (lambda a: Mdma().qdl(), "force QDL mode (aux-first power cycle) for flashing"),
+    "flash":        (flash_flow, "full iteration: QDL -> run host flash command -> boot to live shell [-> --verify CMD]"),
+    "bash":         (bash_script, "run a bash script on the device over serial and print its output"),
+    "reboot":       (lambda a: (Mdma().reboot(qdl=False), _log("power cycle issued (normal boot) — returned immediately, boot NOT verified/awaited (use `boot` for that)"))[0],
+                     "raw power-cycle into normal boot (returns immediately, unverified)"),
+    "off":          (lambda a: (Mdma().power_off(), _log("SOC power cut (VIN + aux off)"))[0],
+                     "cut power to the SOC (VIN + aux off)"),
     "serial":       (lambda a: Mdma().serial(), "open the MSM UART console with screen"),
     "profile-boot": (lambda a: Mdma().profile_boot(), "reboot comma four and profile boot time"),
-    "bash":         (bash_script, "run a bash script on the device over serial and print its output"),
   }
+  aliases = {"reboot-qdl": "qdl"}  # back-compat (agnos-builder scripts)
 
   parser = argparse.ArgumentParser()
   parser.add_argument("--missing-ok", action="store_true", help="continue successfully when no MDMA is connected")
   subparsers = parser.add_subparsers(dest="command", required=True)
   for cmd, (_, hlp) in cmds.items():
-    sp = subparsers.add_parser(cmd, help=hlp)
+    names = [cmd] + [a for a, tgt in aliases.items() if tgt == cmd]
+    sp = subparsers.add_parser(cmd, aliases=names[1:], help=hlp)
     if cmd == "bash":
       sp.add_argument("argv", nargs="*", help="the bash command to run inline; or '-' to read the script from stdin")
       sp.add_argument("--timeout", type=float, default=30.0, help="seconds to wait for output (default 30)")
       sp.add_argument("--wait", type=float, default=0.0, metavar="SECONDS",
                       help="wait up to SECONDS for a booting device to reach a shell prompt before running (default 0 = fail fast)")
+    if cmd == "flash":
+      sp.add_argument("argv", nargs=argparse.REMAINDER,
+                      help="host flash command to run while in QDL (prefix with -- ); one arg = run via shell")
+      sp.add_argument("--verify", metavar="CMD", help="bash command to run on the device (over serial) after boot")
+      sp.add_argument("--timeout", type=float, default=30.0, help="seconds to wait for --verify output (default 30)")
   if len(sys.argv) == 1:
     parser.print_help()
     raise SystemExit(0)
   args = parser.parse_args()
+  args.command = aliases.get(args.command, args.command)
 
   if not Mdma().available():
     print("MDMA not found.")
     raise SystemExit(0 if args.missing_ok else 1)
 
   rc = cmds[args.command][0](args)
-  if isinstance(rc, int):
+  # bool guard: boot/qdl return True on success, which is an int subclass and
+  # would otherwise become exit code 1.
+  if isinstance(rc, int) and not isinstance(rc, bool):
     raise SystemExit(rc)
