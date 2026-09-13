@@ -36,8 +36,9 @@ $SKILL_DIR/scripts/mici --host comma@HOST run 'tap 268 120; wait .6; capture'   
 ```
 
 Transport via `--transport ssh|mdma|auto` (or `MICI_TRANSPORT`): **mdma** = wired
-adapter, no host; **ssh** = pass `--host USER@HOST` (or `MICI_HOST`), ask the user if
-unknown; **auto** (default) prefers MDMA if wired, else SSH.
+adapter, no host; **ssh** = discover with `avahi-browse -rtp _ssh._tcp`, select
+`vendor=comma` / `model=mici`, and pass `--host comma@HOST` (or `MICI_HOST`) using the
+resolved hostname/address; **auto** (default) prefers MDMA if wired, else SSH.
 
 Coordinates are the upright-landscape frame you see in a capture. Prefer `mici run`
 for multi-step flows (one device invocation for the whole chain). **See
