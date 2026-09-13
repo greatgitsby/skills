@@ -23,13 +23,6 @@ npx skills update mici       # update one skill
 npx skills update -g         # global skills only (-p for project only)
 ```
 
-### Claude Code plugin marketplace
-
-```
-/plugin marketplace add greatgitsby/skills
-/plugin install greatgitsby-skills@greatgitsby-skills
-```
-
 ## Add a skill
 
 ```bash
