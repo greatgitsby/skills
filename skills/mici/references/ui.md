@@ -102,8 +102,10 @@ Selected with `--transport ssh|mdma|auto` (or `MICI_TRANSPORT`); the CLI errors 
 chosen transport isn't available.
 - **MDMA serial** — needs the MDMA adapter wired (see `references/mdma.md`). No network,
   no host.
-- **SSH** — needs your key on the device; give the host via `--host USER@HOST` (e.g.
-  `--host comma@192.168.1.5`) or `MICI_HOST`.
+- **SSH** — discover with `avahi-browse -rtp _ssh._tcp`; select the resolved record
+  with `vendor=comma` and `model=mici`. Use its hostname/address as `--host comma@HOST`
+  or `MICI_HOST`; SSH authentication must already be configured. If multiple mici
+  devices appear, ask which one.
 - **auto** (default) — prefers MDMA when wired, else SSH.
 
 If capture errors with "magic broker did not pass a DRM fd", the display service is down —
