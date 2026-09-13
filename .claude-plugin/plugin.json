@@ -1,9 +1,0 @@
-{
-  "name": "greatgitsby-skills",
-  "description": "A collection of agent skills.",
-  "author": {
-    "name": "greatgitsby"
-  },
-  "repository": "https://github.com/greatgitsby/skills",
-  "license": "MIT"
-}
